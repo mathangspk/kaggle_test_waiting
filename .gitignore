@@ -1,0 +1,16 @@
+api_token/
+api_run/
+api_run_pull/
+*.log
+.env
+*.env
+*.sqlite3*
+*.lock
+__pycache__/
+.pytest_cache/
+.deploy/
+secrets/
+.playwright-mcp/
+.opencode/
+opencode.json
+TEAM-HANDOFF.md

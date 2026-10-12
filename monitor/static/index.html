@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Kaggle · Theo dõi lượt chạy</title>
+  <style>
+    :root{--bg:#0c1220;--panel:#141e30;--panel2:#1b2840;--text:#ecf2ff;--muted:#a6b6cf;--line:#2b3a53;--brand:#7bbcff;--green:#71ddb2;--green-bg:#153b32;--amber:#ffcf79;--amber-bg:#49391b;--red:#ffa0a9;--red-bg:#4c2532;--shadow:0 12px 32px #0002}
+    :root[data-theme="light"]{--bg:#f3f6fb;--panel:#fff;--panel2:#eef3fa;--text:#17263d;--muted:#53647c;--line:#d8e1ee;--brand:#1765b3;--green:#146445;--green-bg:#dff4e9;--amber:#855400;--amber-bg:#fff0cf;--red:#a52338;--red-bg:#ffe3e8;--shadow:0 8px 24px #24385208}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}button{font:inherit;color:inherit;cursor:pointer}button:focus-visible,a:focus-visible{outline:3px solid var(--brand);outline-offset:4px}button:disabled{opacity:.6;cursor:wait}main{max-width:1440px;margin:auto;padding:32px}header{display:flex;justify-content:space-between;align-items:center;gap:24px;margin-bottom:24px}.eyebrow{font-size:11px;letter-spacing:2px;font-weight:700;color:var(--brand);text-transform:uppercase}h1{font-size:clamp(24px,3vw,34px);letter-spacing:-1px;margin:4px 0}h2{font-size:18px;margin:0}h3{font-size:16px;margin:0}p{margin:8px 0}.muted{color:var(--muted)}.actions{display:flex;gap:10px;flex-wrap:wrap}.button{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:9px 14px}.button.primary{background:var(--brand);color:var(--bg);border-color:var(--brand);font-weight:700}.statusbar{display:flex;align-items:center;flex-wrap:wrap;gap:12px 24px;padding:14px 18px;background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:20px}.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:650;background:var(--panel2);color:var(--muted)}.good{color:var(--green);background:var(--green-bg)}.warn{color:var(--amber);background:var(--amber-bg)}.bad{color:var(--red);background:var(--red-bg)}.dot{width:7px;height:7px;background:currentColor;border-radius:50%;display:inline-block}.notice{color:var(--muted);border-left:3px solid var(--brand);padding:4px 14px;margin:20px 0}.accounts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:20px 0 24px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.card{padding:20px;min-width:0}.card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:18px}.account-name{overflow-wrap:anywhere}.metric{font-size:29px;font-weight:750;letter-spacing:-1px;line-height:1.3}.metric-label{font-size:12px;color:var(--muted)}.card dl{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0 0}.card dt{color:var(--muted);font-size:12px}.card dd{margin:2px 0;font-weight:600;overflow-wrap:anywhere}.layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(280px,1fr);gap:20px;margin-bottom:24px}.panel{padding:22px;min-width:0}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.legend{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.heatmap{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:8px}.hour{border:1px solid var(--line);border-radius:9px;padding:9px 5px;text-align:center;min-width:0}.hour strong{display:block;font-size:14px}.hour small{display:block;font-size:10px}.hour .value{font-size:13px;font-weight:700;margin:5px 0}.empty{padding:28px 12px;text-align:center;color:var(--muted)}.ranking{list-style:none;padding:0;margin:16px 0 0;display:grid;gap:10px}.ranking li{display:flex;align-items:center;gap:12px;background:var(--panel2);padding:12px;border-radius:10px}.rank-number{font-size:18px;font-weight:700;color:var(--brand);min-width:20px}.rank-body{flex:1;min-width:0}.rank-body small{display:block;color:var(--muted)}.rank-value{font-weight:700;white-space:nowrap}.table-wrap{overflow:auto;margin:16px -1px 0}table{width:100%;border-collapse:collapse;text-align:left;white-space:nowrap}th{font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);font-weight:650}th,td{padding:13px 12px;border-bottom:1px solid var(--line)}th:first-child,td:first-child{padding-left:0}td.run-id{max-width:210px;overflow:hidden;text-overflow:ellipsis}.table-caption{font-size:12px;color:var(--muted);margin-top:12px}.error{padding:12px 16px;border:1px solid var(--red);border-radius:10px;color:var(--red);background:var(--red-bg);margin-bottom:20px}footer{display:flex;justify-content:space-between;gap:12px;margin-top:24px;color:var(--muted);font-size:12px} [hidden]{display:none!important}
+    @media(prefers-color-scheme:light){:root:not([data-theme]){--bg:#f3f6fb;--panel:#fff;--panel2:#eef3fa;--text:#17263d;--muted:#53647c;--line:#d8e1ee;--brand:#1765b3;--green:#146445;--green-bg:#dff4e9;--amber:#855400;--amber-bg:#fff0cf;--red:#a52338;--red-bg:#ffe3e8;--shadow:0 8px 24px #24385208}}
+    @media(max-width:1000px){.accounts{grid-template-columns:repeat(2,minmax(0,1fr))}.layout{grid-template-columns:1fr}}
+    @media(max-width:600px){main{padding:18px 14px}header{align-items:flex-start;flex-direction:column;gap:12px}.accounts{gap:10px}.card{padding:14px}.card-head{align-items:flex-start;flex-direction:column}.card dl{grid-template-columns:1fr;gap:8px}.panel{padding:16px}.heatmap{grid-template-columns:repeat(4,minmax(0,1fr))}.metric{font-size:24px}footer{flex-direction:column}.statusbar{gap:8px 16px}.section-head{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><div class="eyebrow">Kaggle / Run monitor</div><h1>Theo dõi lượt chạy</h1><div class="muted">Một góc nhìn rõ ràng về tài khoản, thời gian chờ và khung giờ.</div></div>
+      <div class="actions"><button class="button" id="theme" aria-label="Chuyển giao diện sáng hoặc tối">Đổi sáng / tối</button><button class="button primary" id="refresh">Làm mới</button></div>
+    </header>
+    <div class="statusbar" role="status" aria-live="polite">
+      <span id="connection" class="badge"><span class="dot"></span>Đang kết nối</span>
+      <span id="freshness" class="muted">Độ mới: chưa xác định</span>
+      <span id="updated" class="muted">Chưa tải dữ liệu</span>
+      <span class="muted">Tự làm mới mỗi 15 giây</span>
+    </div>
+    <div id="error" class="error" role="alert" hidden></div>
+    <div class="notice">Queue được báo cáo bằng <strong>cận trên ước lượng bảo thủ</strong>, không phải thời lượng chính xác. Thời gian <strong>gửi → bắt đầu</strong> là chỉ số riêng, gồm cả độ trễ gửi và xử lý ngoài queue. <span id="cancellation">Không hỗ trợ hủy lượt chạy; việc hủy từ xa chưa được xác minh.</span></div>
+    <div class="statusbar" id="operations" role="status" aria-live="polite">Trạng thái vận hành: chưa xác định.</div>
+    <section aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">Tổng quan tài khoản</h2><span class="muted" id="account-count">4 vị trí theo dõi</span></div><div class="accounts" id="accounts"></div></section>
+    <div class="layout">
+      <section class="panel" aria-labelledby="hours-title">
+        <div class="section-head"><h2 id="hours-title">Trung vị cận trên queue theo giờ</h2><span class="badge" id="timezone">Múi giờ chưa xác định</span></div>
+        <p class="muted" id="coverage">Chưa có thông tin phạm vi mẫu.</p>
+        <div class="legend"><span class="badge good">≤ 300 giây</span><span class="badge warn">&gt; 300–600 giây</span><span class="badge bad">&gt; 600 giây</span><span class="badge">Không có dữ liệu</span></div>
+        <div id="heatmap" class="heatmap" aria-label="Thời gian chờ ước lượng theo 24 giờ"></div>
+        <p class="table-caption" id="hour-method">Chỉ hiển thị thống kê do backend cung cấp; thiếu mẫu không được tính là 0.</p>
+      </section>
+      <section class="panel" aria-labelledby="ranking-title"><h2 id="ranking-title">Khung giờ đáng cân nhắc</h2><p class="muted">Theo thứ hạng backend: tỷ lệ T4×2 xác nhận có cận trên gửi → bắt đầu ≤300 giây / tất cả lượt thử gửi. Đây không phải tỷ lệ queue chính xác; không đảm bảo lần chạy tiếp theo.</p><p class="table-caption" id="rank-policy">Chỉ xếp hạng khi backend xác nhận đủ điều kiện.</p><ol class="ranking" id="ranking"></ol></section>
+    </div>
+    <section class="panel" aria-labelledby="runs-title"><div class="section-head"><h2 id="runs-title">Lượt chạy gần nhất</h2><span class="badge" id="run-count">Chưa có dữ liệu</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Lượt chạy</th><th>Tài khoản</th><th>Trạng thái</th><th>Gửi lúc</th><th>Bắt đầu lúc</th><th>Queue · cận trên ước lượng</th><th>Queue · khoảng bất định</th><th>Gửi → bắt đầu · riêng biệt</th><th>T4×2 / ghi chú</th></tr></thead><tbody id="runs"></tbody></table></div>
+      <p class="table-caption">Hết thời gian quan sát không phải thất bại hay hủy: tài khoản vẫn có thể đang hoạt động. Không quan sát được queued hoặc vẫn đang queued thì có thể chưa có cận trên queue. Timestamps hiển thị theo múi giờ trình duyệt; các nhóm giờ dùng múi giờ backend.</p>
+    </section>
+    <footer><span id="backend-health">Tình trạng bộ thu thập: chưa xác định</span><span>Dữ liệu thực · Không thay thế dữ liệu thiếu bằng số liệu mẫu</span></footer>
+  </main>
+  <script>
+    'use strict';
+    // Canonical API: { accounts: [], runs: [], hours: [], meta: {} }.
+    // Durations are seconds. Timestamps should be ISO 8601 with timezone.
+    // Ranking requires backend rank_eligible === true, rank and success_5m_rate.
+    // Queue upper bounds and submit-to-start latency must never be conflated.
+    const $ = id => document.getElementById(id);
+    const own = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
+    const pick = (o, ...keys) => { for (const k of keys) if (own(o,k) && o[k] !== null && o[k] !== undefined && o[k] !== '') return o[k]; return null; };
+    const num = v => { if (v === null || v === undefined || v === '' || typeof v === 'boolean' || typeof v === 'object') return null; const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : null; };
+    const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const text = v => typeof v === 'string' || typeof v === 'number' ? String(v) : null;
+    const list = v => Array.isArray(v) ? v.filter(x => x && typeof x === 'object' && !Array.isArray(x)) : v && typeof v === 'object' ? Object.entries(v).filter(([,x]) => x && typeof x === 'object' && !Array.isArray(x)).map(([key,x]) => ({key,...x})) : [];
+    const date = v => { if (v === null || v === undefined || v === '') return null; const d = new Date(typeof v === 'number' ? (v < 1e12 ? v*1000 : v) : v); return Number.isFinite(d.getTime()) ? d : null; };
+    const fmtDate = v => { const d = date(v); return d ? new Intl.DateTimeFormat('vi-VN',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short'}).format(d) : '—'; };
+    const seconds = v => v === null ? 'Chưa có dữ liệu' : new Intl.NumberFormat('vi-VN',{maximumFractionDigits:1}).format(v) + ' s';
+    const count = v => v === null ? '—' : new Intl.NumberFormat('vi-VN').format(v);
+    const tone = v => v === null ? '' : v <= 300 ? 'good' : v <= 600 ? 'warn' : 'bad';
+    function status(value) {
+      const s = String(value ?? '').trim().toLowerCase().replace(/[\s-]+/g,'_');
+      if (['queued','pending','waiting','submitted'].includes(s)) return ['Đang hoạt động · chờ','warn'];
+      if (['pushing','collecting'].includes(s)) return [s === 'pushing' ? 'Đang hoạt động · gửi' : 'Đang hoạt động · thu kết quả','warn'];
+      if (['ambiguous','timed_out','timeout'].includes(s)) return ['Đang hoạt động · chưa xác định kết thúc','warn'];
+      if (['active','running','starting','in_progress','busy'].includes(s)) return ['Đang hoạt động','good'];
+      if (['failed','failure','error','invalid_output','wrong_gpu'].includes(s)) return ['Thất bại','bad'];
+      if (['skipped','skip'].includes(s)) return ['Bỏ qua',''];
+      if (['completed','complete','success','succeeded','finished','done'].includes(s)) return ['Hoàn tất','good'];
+      if (['cancelled','canceled','cancelling','canceling','cancel_requested'].includes(s)) return ['Hủy · chưa xác minh','warn'];
+      if (['idle','ready','available','healthy','ok','online'].includes(s)) return ['Sẵn sàng','good'];
+      if (['offline','unhealthy','disabled'].includes(s)) return ['Không khả dụng','bad'];
+      return ['Chưa rõ',''];
+    }
+    const badge = s => { const [label,css] = status(s); return `<span class="badge ${css}" title="${esc(text(s) || 'Không có trạng thái')}">${label}</span>`; };
+    function duration(o) {
+      const explicit = num(pick(o,'queue_estimate_seconds','estimated_queue_seconds','queue_upper_seconds'));
+      return {value:explicit,source:'Queue · cận trên ước lượng'};
+    }
+    function submitLatency(o) {
+      const explicit = num(pick(o,'submit_to_start_seconds','start_latency_seconds'));
+      if (explicit !== null) return explicit;
+      const submitted = date(pick(o,'submitted_at','submit_at','submitted','created_at','queued_at'));
+      const started = date(pick(o,'started_at','start_at','started','running_at'));
+      return submitted && started && started >= submitted ? (started-submitted)/1000 : null;
+    }
+    function bounds(o, prefix = 'queue') {
+      const low = num(pick(o,`${prefix}_lower_seconds`)), high = num(pick(o,`${prefix}_upper_seconds`));
+      if (low === null && high === null) return 'Chưa biết cận';
+      if (low !== null && high !== null) return `${seconds(low)} – ${seconds(high)}`;
+      return low !== null ? `≥ ${seconds(low)} · cận trên chưa biết` : `≤ ${seconds(high)} · cận dưới chưa biết`;
+    }
+    const rate = v => v === null ? '—' : new Intl.NumberFormat('vi-VN',{style:'percent',maximumFractionDigits:1}).format(v);
+    let snapshot = null, lastLoaded = null, fetching = false, healthData = null, healthFailure = null, healthLoaded = null;
+    function normalize(raw) {
+      const root = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+      const data = root && pick(root,'data','summary') || root;
+      if (!data || typeof data !== 'object' || Array.isArray(data) || !['accounts','account_summaries','users','runs','latest_runs','recent_runs','hours','hourly','hour_stats','meta','metadata'].some(k => own(data,k))) throw new Error('Schema phản hồi không được nhận diện.');
+      const meta = {...(pick(data,'meta','metadata') || pick(root,'meta','metadata') || {})};
+      for (const k of ['timezone','auto_probes','ready','minimum_rank_days','configuration_error','cancellation_supported']) if (!own(meta,k) && own(data,k)) meta[k] = data[k];
+      const hours = list(pick(data,'hours','hourly','hour_stats','hourly_stats')).map(o => {
+        const h = num(pick(o,'hour','hour_of_day','local_hour','key'));
+        const samples = num(pick(o,'sample_count','samples','count','n','run_count')), days = num(pick(o,'day_count','days_count','distinct_days','days'));
+        const r = num(pick(o,'success_5m_rate'));
+        return {hour:h, value:num(pick(o,'median_queue_seconds')), samples, days,
+          queueSamples:num(pick(o,'queue_sample_count')), unknown:num(pick(o,'unknown_queue')),
+          eligible:pick(o,'rank_eligible') === true, rank:num(pick(o,'rank')), rate:r !== null && r <= 1 ? r : null,
+          fast:num(pick(o,'within_5m_t4x2')), denominator:num(pick(o,'denominator'))};
+      }).filter(o => Number.isInteger(o.hour) && o.hour < 24);
+      return {accounts:list(pick(data,'accounts','account_summaries','users')),runs:list(pick(data,'runs','latest_runs','recent_runs','executions')),hours,meta};
+    }
+    function render(s) {
+      const {accounts,runs,hours,meta} = s;
+      $('account-count').textContent = accounts.length ? `${accounts.length} tài khoản trong phản hồi${accounts.length > 4 ? ' · hiển thị 4 đầu tiên' : ''}` : '4 vị trí · chưa có dữ liệu tài khoản';
+      $('accounts').innerHTML = Array.from({length:4},(_,i) => {
+        const a = accounts[i];
+        if (!a) return `<article class="card"><div class="card-head"><h3>Vị trí ${i+1}</h3><span class="badge">Chưa rõ</span></div><div class="metric">—</div><div class="metric-label">Chưa có dữ liệu tài khoản</div><p class="muted">Chờ thông tin từ bộ thu thập.</p></article>`;
+        const d = duration(a), name = text(pick(a,'name','account_name','username','account','id','key')) || `Tài khoản ${i+1}`;
+        return `<article class="card"><div class="card-head"><h3 class="account-name">${esc(name)}</h3>${badge(pick(a,'status','state','health'))}</div><div class="metric ${tone(d.value)}" style="background:none">${d.value === null ? '—' : esc(seconds(d.value))}</div><div class="metric-label">Queue · cận trên ước lượng của mẫu gửi gần nhất</div><p class="muted">Khoảng bất định: ${esc(bounds(a))}</p><dl><div><dt>Số mẫu</dt><dd>${count(num(pick(a,'sample_count','samples','run_count','total_runs')))}</dd></div><div><dt>Số ngày phủ</dt><dd>${count(num(pick(a,'day_count','days_count','distinct_days')))}</dd></div><div><dt>Lượt đang hoạt động</dt><dd>${count(num(pick(a,'active_runs','active_count','running_count')))}</dd></div><div><dt>Dữ liệu cập nhật</dt><dd>${esc(fmtDate(pick(a,'updated_at','last_seen_at','last_updated','last_seen')))}</dd></div></dl></article>`;
+      }).join('');
+      $('timezone').textContent = text(pick(meta,'timezone','time_zone','tz')) || 'Múi giờ chưa xác định';
+      const sampleCount = num(pick(meta,'sample_count','samples','total_samples')), dayCount = num(pick(meta,'day_count','days_count','distinct_days','coverage_days'));
+      const from = pick(meta,'period_start','window_start','from'), to = pick(meta,'period_end','window_end','to');
+      $('coverage').textContent = `Phạm vi: ${sampleCount === null ? 'chưa rõ số' : count(sampleCount)} mẫu · ${dayCount === null ? 'chưa rõ số' : count(dayCount)} ngày${from || to ? ` · ${fmtDate(from)} → ${fmtDate(to)}` : ''}`;
+      const groups = new Map(); hours.forEach(h => { if (!groups.has(h.hour)) groups.set(h.hour,[]); groups.get(h.hour).push(h); });
+      // Do not invent aggregation weights for multiple account/day rows of one hour.
+      const unique = Array.from(groups.values()).filter(g => g.length === 1).map(g => g[0]);
+      $('heatmap').innerHTML = Array.from({length:24},(_,h) => {
+        const group = groups.get(h), o = group?.length === 1 ? group[0] : null;
+        const usable = o && o.value !== null && o.queueSamples !== 0;
+        return `<div class="hour ${usable ? tone(o.value) : ''}" aria-label="${h} giờ: ${esc(usable ? `Trung vị cận trên queue ${seconds(o.value)}, ${count(o.queueSamples)} mẫu queue, ${count(o.days)} ngày` : group?.length > 1 ? 'Dữ liệu trùng giờ, cần backend tổng hợp' : 'Chưa có dữ liệu queue')}"><strong>${String(h).padStart(2,'0')}:00</strong><div class="value">${usable ? esc(seconds(o.value)) : '—'}</div><small>${usable ? 'Trung vị cận trên' : group?.length > 1 ? 'Trùng giờ' : 'Chưa rõ queue'}</small><small>${o ? `${count(o.queueSamples)} mẫu queue / ${count(o.samples)} lượt gửi` : '— mẫu'}</small><small>${o ? `${count(o.days)} ngày · ${count(o.unknown)} queue chưa rõ` : '— ngày'}</small><small>T4×2 ≤5p: ${o ? rate(o.rate) : '—'}</small></div>`;
+      }).join('');
+      const ranked = unique.filter(h => h.eligible && Number.isInteger(h.rank) && h.rank > 0 && h.rate !== null).sort((a,b) => a.rank-b.rank).slice(0,5);
+      $('rank-policy').textContent = `Điều kiện: rank_eligible=true và có thứ hạng backend.${num(meta.minimum_rank_days) !== null ? ` Tối thiểu ${count(num(meta.minimum_rank_days))} ngày có lượt gửi.` : ''} Không suy ra đủ điều kiện chỉ từ số mẫu.`;
+      $('ranking').innerHTML = ranked.length ? ranked.map(h => `<li><span class="rank-number">${h.rank}</span><div class="rank-body"><strong>${String(h.hour).padStart(2,'0')}:00–${String(h.hour).padStart(2,'0')}:59</strong><small>T4×2 xác nhận ≤300s gửi → bắt đầu: ${count(h.fast)} / ${count(h.denominator)} lượt thử gửi</small><small>${count(h.samples)} mẫu · ${count(h.days)} ngày</small><small>Trung vị cận trên queue: ${esc(seconds(h.value))} · ${count(h.queueSamples)} mẫu queue</small></div><span class="rank-value">${rate(h.rate)}</span></li>`).join('') : '<li class="empty">Chưa có giờ được backend xác nhận đủ điều kiện và cấp thứ hạng với tỷ lệ T4×2 ≤300s.</li>';
+      $('hour-method').textContent = 'median_queue_seconds: trung vị các cận trên queue đã biết, không phải trung vị thời gian queue chính xác. Số mẫu queue khác số lượt thử gửi; cận chưa biết không được tính là 0. Các nhóm giờ theo lịch probe, trên toàn bộ lịch sử. T4×2 ≤5p là gửi → bắt đầu, không phải queue.';
+      const sorted = runs.map((r,i) => ({r,i,t:date(pick(r,'submitted_at','submit_at','submitted','created_at','queued_at','scheduled_at'))?.getTime() ?? -Infinity})).sort((a,b) => b.t-a.t || a.i-b.i).slice(0,50);
+      $('run-count').textContent = `${runs.length} lượt trong phản hồi${runs.length > 50 ? ' · hiển thị 50 gần nhất' : ''}`;
+      $('runs').innerHTML = sorted.length ? sorted.map(({r}) => {
+        const d = duration(r), latency = submitLatency(r);
+        const notes = [r.t4x2 === true ? 'T4×2 xác nhận' : r.t4x2 === false ? 'Không xác nhận T4×2' : 'GPU chưa rõ'];
+        if (r.observation_timed_out) notes.push('Hết thời gian quan sát · không phải hủy');
+        if (r.over_600_observation) notes.push('>600s chưa quan sát bắt đầu · queue chưa chắc');
+        if (r.unacceptable) notes.push('Cận dưới queue >600s');
+        if (r.submit_to_start_unacceptable) notes.push('Gửi → bắt đầu >600s');
+        if (text(r.skip_reason)) notes.push(`Bỏ qua: ${r.skip_reason}`);
+        if (text(r.error)) notes.push(`Lỗi: ${r.error}`);
+        return `<tr><td class="run-id" title="${esc(text(pick(r,'id','run_id','kernel_id','notebook','name')) || '—')}">${esc(text(pick(r,'id','run_id','kernel_id','notebook','name')) || '—')}</td><td>${esc(text(pick(r,'account','account_name','username','account_id')) || '—')}</td><td>${badge(pick(r,'status','state','result'))}</td><td>${esc(fmtDate(pick(r,'submitted_at','submit_at','submitted','created_at','queued_at')))}</td><td>${esc(fmtDate(pick(r,'started_at','start_at','started','running_at')))}</td><td><span class="badge ${tone(d.value)}">${esc(seconds(d.value))}</span></td><td class="muted">${esc(bounds(r))}</td><td><span class="badge ${tone(latency)}">${esc(seconds(latency))}</span><br><small class="muted">${esc(bounds(r,'submit_to_start'))}</small></td><td class="muted">${notes.map(esc).join('<br>')}</td></tr>`;
+      }).join('') : '<tr><td colspan="9" class="empty">Chưa có dữ liệu lượt chạy.</td></tr>';
+      const health = pick(meta,'health','collector_status','backend_status','status');
+      const h = typeof health === 'object' && health ? pick(health,'status','state') : health;
+      $('backend-health').textContent = `Tình trạng bộ thu thập: ${h === null ? 'chưa xác định' : status(h)[0]}`;
+      renderOperations();
+      updateFreshness();
+    }
+    function renderOperations() {
+      const meta = snapshot?.meta || {}, health = healthData || {};
+      const choose = key => own(health,key) ? health[key] : pick(meta,key);
+      const auto = choose('auto_probes'), ready = choose('ready');
+      const configError = choose('configuration_error'), workerError = choose('worker_error');
+      const readinessError = health.readiness && health.readiness.ok === false ? text(health.readiness.error) : null;
+      const pieces = [healthFailure ? `<span class="badge bad">/healthz: ${esc(healthFailure)}${healthLoaded ? ' · dữ liệu cũ' : ''}</span>` : `<span class="badge ${health.ok === true ? 'good' : health.ok === false ? 'bad' : ''}">/healthz: ${health.ok === true ? 'worker khỏe' : health.ok === false ? 'worker không khỏe' : 'chưa xác định'}</span>`];
+      pieces.push(`<span class="badge ${auto === false ? 'warn' : auto === true ? 'good' : ''}">Probe tự động: ${auto === false ? 'đã tắt' : auto === true ? 'đã bật' : 'chưa rõ'}</span>`);
+      pieces.push(`<span class="badge ${ready === false ? 'warn' : ready === true ? 'good' : ''}">Sẵn sàng chạy probe: ${ready === true ? 'có' : ready === false ? 'chưa' : 'chưa rõ'}</span>`);
+      if (health.worker_alive === false) pieces.push('<span class="badge bad">Worker đã dừng</span>');
+      if (configError) pieces.push(`<span class="badge bad">Lỗi cấu hình: ${esc(text(configError) || 'chưa rõ')}</span>`);
+      if (workerError) pieces.push(`<span class="badge bad">Lỗi worker: ${esc(text(workerError) || 'chưa rõ')}</span>`);
+      if (readinessError) pieces.push(`<span class="badge warn">Kiểm tra sẵn sàng: ${esc(readinessError)}</span>`);
+      const heartbeat = pick(health,'heartbeat_utc','heartbeat') || pick(meta,'heartbeat_utc','heartbeat');
+      pieces.push(`<span class="muted">Heartbeat: ${esc(fmtDate(heartbeat))}</span>`);
+      if (healthLoaded) pieces.push(`<span class="muted">Health tải lúc: ${esc(fmtDate(healthLoaded))}</span>`);
+      $('operations').innerHTML = pieces.join('');
+      $('cancellation').textContent = meta.cancellation_supported === true ? 'Backend báo hỗ trợ hủy; dashboard không xác minh hủy từ xa.' : 'Không hỗ trợ hủy lượt chạy; việc hủy từ xa chưa được xác minh.';
+    }
+    async function refreshHealth() {
+      const controller = new AbortController(), timeout = setTimeout(() => controller.abort(),12000);
+      try {
+        const response = await fetch('/healthz',{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
+        const data = await response.json();
+        if (!data || typeof data !== 'object' || Array.isArray(data) || typeof data.ok !== 'boolean') throw new Error(`Phản hồi health không hợp lệ (HTTP ${response.status})`);
+        healthData = data; healthLoaded = new Date();
+        healthFailure = response.ok || response.status === 503 ? null : `HTTP ${response.status}`;
+      } catch (e) { healthFailure = e.name === 'AbortError' ? 'quá thời gian chờ' : e instanceof SyntaxError ? 'JSON không hợp lệ' : e.message; }
+      finally { clearTimeout(timeout); renderOperations(); }
+    }
+    function updateFreshness() {
+      const meta = snapshot?.meta || {};
+      const stamp = date(pick(meta,'data_updated_at','last_observed_at','last_collected_at','updated_at','last_updated'));
+      const maxAge = num(pick(meta,'stale_after_seconds','freshness_threshold_seconds')) ?? 60;
+      const age = stamp ? (Date.now()-stamp.getTime())/1000 : null;
+      const stale = pick(meta,'stale','is_stale') === true || (age !== null && age > maxAge);
+      $('freshness').className = age === null ? 'muted' : `badge ${age < -30 || stale ? 'warn' : 'good'}`;
+      $('freshness').textContent = age === null ? 'Độ mới: chưa xác định' : age < -30 ? 'Mốc dữ liệu ở tương lai · kiểm tra đồng hồ' : `Dữ liệu ${stale ? 'cũ' : 'mới'} · ${Math.max(0,Math.floor(age))} giây trước`;
+      $('freshness').title = stamp ? `Mốc backend: ${stamp.toISOString()}; ngưỡng dữ liệu cũ: ${maxAge} giây` : 'Backend chưa cung cấp mốc cập nhật dữ liệu.';
+      $('updated').textContent = lastLoaded ? `Tải thành công: ${fmtDate(lastLoaded)}` : 'Chưa tải dữ liệu';
+    }
+    async function refresh() {
+      if (fetching) return;
+      fetching = true; $('refresh').disabled = true;
+      const healthTask = refreshHealth();
+      $('connection').className = 'badge'; $('connection').innerHTML = '<span class="dot"></span>Đang tải';
+      const controller = new AbortController(), timeout = setTimeout(() => controller.abort(),12000);
+      try {
+        const response = await fetch('/api/summary',{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const next = normalize(await response.json());
+        snapshot = next; lastLoaded = new Date(); render(snapshot);
+        $('error').hidden = true; $('connection').className = 'badge good'; $('connection').innerHTML = '<span class="dot"></span>API kết nối tốt';
+      } catch (e) {
+        $('connection').className = 'badge bad'; $('connection').innerHTML = '<span class="dot"></span>Không tải được API';
+        $('error').textContent = `Không thể cập nhật: ${e.name === 'AbortError' ? 'quá thời gian chờ 12 giây' : e instanceof SyntaxError ? 'phản hồi không phải JSON hợp lệ' : e.message}. ${snapshot ? 'Đang hiển thị bản dữ liệu thành công gần nhất.' : 'Chưa có dữ liệu để hiển thị.'} Sẽ thử lại sau 15 giây.`;
+        $('error').hidden = false; updateFreshness();
+      } finally { clearTimeout(timeout); await healthTask; fetching = false; $('refresh').disabled = false; }
+    }
+    const themeButton = $('theme');
+    function setTheme(theme) { document.documentElement.dataset.theme = theme; themeButton.textContent = theme === 'dark' ? 'Chuyển sang sáng' : 'Chuyển sang tối'; themeButton.setAttribute('aria-label',themeButton.textContent); }
+    try { const saved = localStorage.getItem('kaggle-monitor-theme'); if (saved === 'dark' || saved === 'light') setTheme(saved); } catch (_) {}
+    themeButton.addEventListener('click',() => { const current = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); const next = current === 'dark' ? 'light' : 'dark'; setTheme(next); try { localStorage.setItem('kaggle-monitor-theme',next); } catch (_) {} });
+    $('refresh').addEventListener('click',refresh);
+    render({accounts:[],runs:[],hours:[],meta:{}});
+    refresh();
+    setInterval(refresh,15000);
+    setInterval(updateFreshness,1000);
+  </script>
+</body>
+</html>

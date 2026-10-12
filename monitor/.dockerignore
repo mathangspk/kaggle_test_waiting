@@ -1,0 +1,7 @@
+.deploy
+secrets
+tests
+__pycache__
+*.sqlite3*
+.pytest_cache
+deploy.py
