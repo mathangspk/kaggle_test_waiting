@@ -1,0 +1,191 @@
+{
+  "repo": "mathangspk/kaggle_test_waiting",
+  "synced_at": "2026-10-13T16:08:59.391735+00:00",
+  "issues": [
+    {
+      "body": "Independent meaningful tests for pending unresolved failures, sparse account imbalance, actual submission bucket, confidence and wait+allocation recommendation; production tracking no duplicate resubmit, no fake queue/start. Frontend and live browser checks, preserved DB backup, deploy, sync roadmap and record limitations. External Kaggle cancellation #4 remains blocked.",
+      "number": 17,
+      "state": "CLOSED",
+      "title": "[P1] Verify statistical semantics and deploy decision improvements",
+      "updatedAt": "2026-10-13T16:08:57Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/17"
+    },
+    {
+      "body": "Provide CLI wrapper to submit a user notebook via existing Kaggle API while recording source=production identity timestamps accelerator; never modify production notebook content by default. Separate production from probes, no fabricated start if artifact absent. Support explicit timing instrumentation contract/observed transition bounds. Expose sample volume quota limitations and configurable balanced probe interval; default30m unchanged. Measure policy benefits on held-out dates rather than claim192 samples/day improves decisions automatically.",
+      "number": 16,
+      "state": "CLOSED",
+      "title": "[P1] Track real production submissions and sampling utility",
+      "updatedAt": "2026-10-13T16:08:55Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/16"
+    },
+    {
+      "body": "Replace queue primary heatmap with confirmed submit-to-start distributions and sample/unknown coverage; queue diagnostic secondary. Explain best hour means allocation experience not Kaggle GPU inventory. Two modes earliest start vs schedule allowed horizon: waiting time+allocation time, abstain missing evidence, preliminary confidence and equivalent groups, filter account/source weekday type. Keep failed pending censored visible.",
+      "number": 15,
+      "state": "CLOSED",
+      "title": "[P1] Decision UI: send now versus schedule with confidence",
+      "updatedAt": "2026-10-13T16:08:52Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/15"
+    },
+    {
+      "body": "Primary metric submit-to-start correct T4x2, group by actual submission not scheduled slot. Separate confirmed <=5m, confirmed5..10m, >10m, provider/API failure, unresolved, skipped; pending never silently failure. Report pessimistic/optimistic outcome bounds, Wilson confidence on resolved observations explicitly preliminary correlated samples. 2h windows, weekday/weekend, per-account and equal-account aggregate, coverage/min samples/dates/account guards; no unsupported best-hour rank.",
+      "number": 14,
+      "state": "CLOSED",
+      "title": "[P0] Correct allocation statistics and unresolved outcome uncertainty",
+      "updatedAt": "2026-10-13T16:08:50Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/14"
+    },
+    {
+      "body": "Verify meaningful backend recovery tests, production frontend build and browser navigation, mobile and live data behavior. Deploy Docker preserving SQLite volume and Tailscale 8443. Check readiness and historical data; report unresolved cancellation #4 honestly.",
+      "number": 13,
+      "state": "CLOSED",
+      "title": "[P1] Verify and deploy roadmap dashboard",
+      "updatedAt": "2026-10-13T14:49:53Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/13"
+    },
+    {
+      "body": "Implement Vietnamese shadcn/ui dashboard with sidebar, Overview, Hours, Runs, Roadmap, React Flow Logic Map and Operations. Vite static build served by existing FastAPI. Roadmap snapshot from GitHub with sync timestamp; dependencies and blockers clickable. Runtime graph read-only with live occupancy and explanations. No external CDN or fabricated values.",
+      "number": 12,
+      "state": "CLOSED",
+      "title": "[P1] React dashboard with roadmap and interactive logic map",
+      "updatedAt": "2026-10-13T14:43:24Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/12"
+    },
+    {
+      "body": "Implement bounded readiness retry, recovery of interrupted pushing states without duplicate submission, stale heartbeat visibility, safe shutdown grace, persistent next-window scheduling, and efficient summary reads. Preserve unresolved remote jobs and history. Verify failure/restart tests and live health.",
+      "number": 11,
+      "state": "CLOSED",
+      "title": "[P0] Harden collector recovery and 24/7 health",
+      "updatedAt": "2026-10-13T14:43:20Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/11"
+    },
+    {
+      "body": "Deployment live: https://vm-manager-thangma-z97m-d3h.tailf1bdc4.ts.net:8443 (tailnet only). Completed implementation/verification issues #1 #2 #3 #5 #6 #7 #8 #9. Remaining BLOCKED #4: exact native session identity mapping and live queued cancellation. Four accounts submit stratified randomized T4x2 probes once per 30m window; max one active per account. Three accounts have confirmed 2xT4 artifacts, fourth queued. 49 tests passed in deployed Python 3.12. Dedicated Ed25519 SSH key verified. Source exists local C:/local/kaggle_test/monitor and deployed server /home/thangma/kaggle-queue-monitor. No commit/push performed (requires explicit request). Rankings withheld until sufficient observed dates; no GPU availability guarantees. Keep roadmap open for cancellation acceptance.",
+      "number": 10,
+      "state": "OPEN",
+      "title": "[Roadmap] Kaggle T4 x2 Queue Monitor",
+      "updatedAt": "2026-10-13T14:49:56Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/10"
+    },
+    {
+      "body": "Acceptance: 49 tests passed in deployed Python 3.12 container; independent QA reviewed duplicate prevention, persistence, credentials, identity, API responsiveness and UI. Real T4x2 probes verified. Queued cancellation remains separately blocked in #4; long-duration/429 behavior covered by mocks, not claimed live.",
+      "number": 9,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Kiểm thử và nghiệm thu",
+      "updatedAt": "2026-10-12T15:53:21Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/9"
+    },
+    {
+      "body": "Deployment: Docker Compose restart policy, durable SQLite volume, readonly secrets mount, dedicated Ed25519 SSH key, Tailscale HTTPS port 8443. Acceptance: key-only login verified, health ready and auto probes true, existing 443 service retained. Live URL: https://vm-manager-thangma-z97m-d3h.tailf1bdc4.ts.net:8443",
+      "number": 8,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Docker SSH key và Tailscale HTTPS",
+      "updatedAt": "2026-10-12T15:51:19Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/8"
+    },
+    {
+      "body": "Dashboard: Vietnamese responsive static UI, four account cards, latest runs, hourly heatmap, backend-qualified ranking, worker health and 15s refresh. Acceptance: reachable on tailnet, normalized API schema, HTML escaping, missing data honest. Evidence: Node render checks and actual browser access.",
+      "number": 7,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Dashboard giám sát",
+      "updatedAt": "2026-10-12T15:51:16Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/7"
+    },
+    {
+      "body": "Statistics: Vietnam local hour, <=300s verified T4x2 starts / all attempted submissions, queue bounds separate, failures/incomplete/skips/day coverage disclosed. Acceptance: no zero for unknown queue and rankings withheld below 3 observed dates. Evidence: stats tests and live UI no premature ranking.",
+      "number": 6,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Thống kê khung giờ push",
+      "updatedAt": "2026-10-12T15:51:12Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/6"
+    },
+    {
+      "body": "Scheduler: four randomized strata per 1800s window, shuffled account order, exactly one opportunity/account/window. Acceptance: max one active/account including case normalization, persistent plans, expired/busy slots recorded, no catchup burst. Evidence: scheduler/property/concurrent claims tests and live schedule.",
+      "number": 5,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Scheduler phân tầng 30 phút",
+      "updatedAt": "2026-10-12T15:51:08Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/5"
+    },
+    {
+      "body": "Cancellation research: public SDK exposes cancel_kernel_session with kernel_session_id, but installed public contracts do not resolve exact pushed batch version to native session ID. Acceptance requires verified account/ref/version mapping, authorized cancel, and confirmed terminal state. BLOCKED: no verified ID resolver or live queued cancellation. Auto-cancel remains disabled; >10m alerts do not pretend cancellation.",
+      "number": 4,
+      "state": "OPEN",
+      "title": "[Kaggle Monitor] Kiểm chứng hủy queued quá 10 phút",
+      "updatedAt": "2026-10-12T15:53:14Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/4"
+    },
+    {
+      "body": "Collector: exact version-qualified SDK requests v<N>; push/status/output latencies, retry/backoff, conservative queue bounds and separate submit-to-start. Acceptance: missing queue remains unknown; stale output rejected; ambiguous push reconciles full source without duplicate submit. Evidence: live artifacts and 49 tests.",
+      "number": 3,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Collector queued và API latency",
+      "updatedAt": "2026-10-12T15:51:06Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/3"
+    },
+    {
+      "body": "Implemented isolated credentials for 4 accounts from external production dotenv; dedicated private queue-monitor-probe kernels request NvidiaTeslaT4. Acceptance: all 4 accounts successfully submit owned probes and exact versions are reconciled; artifact validator verifies 2 actual Tesla T4 devices when allocation completes. Live evidence: thangma, annalynhi, thanglong1996 produced successful 2xT4 artifacts; thnhmngc version1 accepted and currently queued, tracked correctly. GPU availability is a measurement outcome, not an account integration failure. Missing allocation output remains unknown, never fabricated.",
+      "number": 2,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Tích hợp 4 tài khoản và probe T4 x2",
+      "updatedAt": "2026-10-12T15:53:19Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/2"
+    },
+    {
+      "body": "Foundation: FastAPI app, persistent SQLite WAL store, schema initialization and single-collector lock. Acceptance: durable run/call/history records; configuration excludes secrets; restart preserves data. Evidence: monitor/app.py, Docker named volume, 49 passing runtime tests.",
+      "number": 1,
+      "state": "CLOSED",
+      "title": "[Kaggle Monitor] Khởi tạo ứng dụng và database",
+      "updatedAt": "2026-10-12T15:51:03Z",
+      "url": "https://github.com/mathangspk/kaggle_test_waiting/issues/1"
+    }
+  ],
+  "dependencies": [
+    {
+      "from": 1,
+      "to": 2
+    },
+    {
+      "from": 1,
+      "to": 3
+    },
+    {
+      "from": 2,
+      "to": 5
+    },
+    {
+      "from": 3,
+      "to": 5
+    },
+    {
+      "from": 3,
+      "to": 6
+    },
+    {
+      "from": 6,
+      "to": 7
+    },
+    {
+      "from": 5,
+      "to": 9
+    },
+    {
+      "from": 7,
+      "to": 8
+    },
+    {
+      "from": 8,
+      "to": 9
+    },
+    {
+      "from": 11,
+      "to": 13
+    },
+    {
+      "from": 12,
+      "to": 13
+    }
+  ],
+  "blocked": [
+    4
+  ]
+}

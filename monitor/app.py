@@ -3,6 +3,7 @@
 Configuration (process environment, never the credentials file):
 ACCOUNTS_ENV=/external/accounts.env; AUTO_PROBES=false (default);
 MONITOR_DB=monitor.sqlite3; MIN_RANK_DAYS=3; CALL_TIMEOUT=45.
+SAMPLING_INTERVAL_MINUTES=30 (allowed: 30, 60, 120).
 External production dotenv schema: PRODUCTION_KAGGLE_ACCOUNT_COUNT=N,
 PRODUCTION_KAGGLE_ACCOUNT_1_USERNAME=..., PRODUCTION_KAGGLE_ACCOUNT_1_API_TOKEN=...
 (1-based). Also accepts ACCOUNT_COUNT=N, ACCOUNT_1_USERNAME=...,
@@ -19,6 +20,8 @@ continues low-frequency exact-version polling. No stop endpoint is provided.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import importlib.metadata
 import io
 import json
@@ -35,14 +38,106 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
 LOCAL = ZoneInfo("Asia/Ho_Chi_Minh")
 SLUG = "queue-monitor-probe"
+
+# Bumped whenever the normalized payload contract for /api/summary, /api/logic
+# or /api/roadmap changes in a way clients may need to detect.
+SCHEMA_VERSION = 1
+
+# Explicit closed vocabularies. App states are what this collector persists.
+# Provider states are the only remote statuses accepted from the SDK. Named
+# constants prevent a fabricated or misspelled state from entering history.
+APP_STATES = frozenset({
+    "scheduled", "pushing", "ambiguous", "submitted", "queued", "running",
+    "timed_out", "collecting", "success", "failed", "wrong_gpu",
+    "invalid_output", "cancelled", "skipped",
+})
 ACTIVE = ("pushing", "ambiguous", "submitted", "queued", "running", "timed_out", "collecting")
-TERMINAL = {"complete", "error", "cancelled"}
+ACTIVE_STATES = frozenset(ACTIVE)
+TERMINAL_STATES = frozenset({"success", "failed", "wrong_gpu", "invalid_output", "cancelled"})
+PENDING_STATES = frozenset({"scheduled", "skipped"})
+
+PROVIDER_STATES = frozenset({"queued", "running", "pending", "cancel_requested",
+                             "complete", "error", "cancelled"})
+PROVIDER_TERMINAL = frozenset({"complete", "error", "cancelled"})
+# Historical alias: TERMINAL previously held provider terminal statuses.
+TERMINAL = PROVIDER_TERMINAL
+
+# Readiness is retried on a bounded exponential backoff and re-verified after a
+# long success interval. The watchdog only restarts the process when the worker
+# is provably dead or hung past every bounded remote call.
+READINESS_BACKOFF_INITIAL = 5.0
+READINESS_BACKOFF_MAX = 300.0
+READINESS_RECHECK_SECONDS = 1800.0
+WATCHDOG_INTERVAL_SECONDS = 5.0
+WATCHDOG_CALL_MARGIN_SECONDS = 30.0
+DEFAULT_CALL_TIMEOUT = 45.0
+SUMMARY_RUN_LIMIT = 5000
+
+# Canonical runtime graph: nodes are the app states plus the collector/service
+# boundary; edges are the only allowed progressions. Served read-only by
+# /api/logic with live occupancy so the dashboard never fabricates transitions.
+APP_STATE_DESCRIPTIONS = {
+    "scheduled": "Slot planned for a 30-minute window; no remote job exists yet.",
+    "pushing": "Submitting the private probe kernel; the remote save may be in flight.",
+    "ambiguous": "Push outcome unknown. Blocked pending exact-version reconciliation; never resubmitted.",
+    "submitted": "Push acknowledged with a confirmed version; observing provider status.",
+    "queued": "Provider reports this exact version queued.",
+    "running": "Provider reports this exact version running.",
+    "timed_out": "Legacy active timeout state. Current polling records observation_timed_out without cancelling or releasing the run.",
+    "collecting": "Provider confirmed terminal complete; fetching exact-version timing evidence.",
+    "success": "Validated timing artifact showing two T4 devices. Terminal.",
+    "wrong_gpu": "Validated timing artifact without two T4 devices. Terminal.",
+    "invalid_output": "Exact version confirmed terminal but timing evidence stayed invalid after bounded retries. Terminal.",
+    "cancelled": "Provider acknowledged cancellation. Terminal.",
+    "failed": "Provider failure or explicit push rejection. Terminal.",
+    "skipped": "Slot not launched (missed/disabled/blocked); no remote job exists.",
+}
+LOGIC_EDGES = (
+    ("scheduled", "pushing", "Launch throttled to one push per 15s and one active run per account."),
+    ("scheduled", "skipped", "Missed slot, probes disabled, not ready, or account already active."),
+    ("pushing", "submitted", "Push response identity and version parsed exactly."),
+    ("pushing", "ambiguous", "Timeout, unconfirmed identity, or an interrupted call. No resubmission."),
+    ("pushing", "failed", "Explicit provider rejection of the save."),
+    ("ambiguous", "submitted", "Reconciliation matched full source nonce and exact version."),
+    ("ambiguous", "ambiguous", "Reconciliation still unconfirmed; account stays blocked."),
+    ("submitted", "queued", "Provider reports queued for this version."),
+    ("submitted", "running", "Provider reports running for this version."),
+    ("submitted", "collecting", "Provider reports complete for this version."),
+    ("submitted", "cancelled", "Provider acknowledged cancellation."),
+    ("submitted", "failed", "Provider reports failure for this version."),
+    ("queued", "running", "Queue observed, then running."),
+    ("queued", "collecting", "Queue observed, then complete without a running observation."),
+    ("queued", "failed", "Provider failure while queued."),
+    ("running", "collecting", "Running observed, then complete."),
+    ("running", "failed", "Provider failure while running."),
+    ("collecting", "success", "Exact-version artifact validated as T4x2."),
+    ("collecting", "wrong_gpu", "Exact-version artifact validated but without two T4 devices."),
+    ("collecting", "invalid_output", "Bounded retries exhausted; exact version is terminal."),
+    ("collecting", "collecting", "Retry exact-version output fetch with bounded backoff."),
+) + tuple(
+    (source, target, {
+        "submitted": "Provider reports pending or cancellation requested; keep the account active.",
+        "queued": "Provider reports queued for the exact version; keep observing.",
+        "running": "Provider reports running for the exact version; keep observing.",
+        "collecting": "Provider confirms complete; collect exact-version evidence.",
+        "cancelled": "Provider acknowledges cancellation; the run is terminal.",
+        "failed": "Provider confirms failure; the run is terminal.",
+    }[target])
+    for source in ("submitted", "queued", "running", "timed_out")
+    for target in ("submitted", "queued", "running", "collecting", "cancelled", "failed")
+    if (source, target) not in {
+        ("submitted", "queued"), ("submitted", "running"), ("submitted", "collecting"),
+        ("submitted", "cancelled"), ("submitted", "failed"), ("queued", "running"),
+        ("queued", "collecting"), ("queued", "failed"), ("running", "collecting"),
+        ("running", "failed"),
+    }
+)
 
 
 def iso(ts: float) -> str:
@@ -88,13 +183,22 @@ def parse_accounts(values: dict) -> list[Account]:
     return result
 
 
-def stratified_plan(window: int, usernames: list[str], rng=None) -> list[dict]:
+def configured_sampling_interval(value=None):
+    value = os.getenv("SAMPLING_INTERVAL_MINUTES", "30") if value is None else value
+    if isinstance(value, bool) or str(value) not in {"30", "60", "120"}:
+        raise ValueError("SAMPLING_INTERVAL_MINUTES must be 30, 60 or 120")
+    return int(value)
+
+
+def stratified_plan(window: int, usernames: list[str], rng=None, window_seconds=1800) -> list[dict]:
+    if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) or window_seconds <= 0:
+        raise ValueError("window_seconds must be a positive integer")
     rng = rng or random.SystemRandom()
     order = list(usernames)
     if not order:
         return []
     rng.shuffle(order)
-    width = 1800 / len(order)
+    width = window_seconds / len(order)
     plan = []
     for slot, name in enumerate(order):
         # One account per stratum, one probe per account per UTC window.
@@ -154,7 +258,7 @@ def parse_status(value) -> str:
     text = str(value).strip().lower().split(".")[-1]
     text = {"completed": "complete", "failed": "error", "canceled": "cancelled",
             "cancel_acknowledged": "cancelled", "new_script": "pending"}.get(text, text)
-    if text not in {"queued", "running", "pending", "cancel_requested", *TERMINAL}:
+    if text not in PROVIDER_STATES:
         raise ValueError("Unknown provider status")
     return text
 
@@ -281,9 +385,356 @@ def hourly_stats(runs: list[dict], min_days: int = 3) -> list[dict]:
     return result
 
 
+ANALYSIS_POLICY = {"min_resolved": 20, "min_days": 7, "interval_minutes": 30}
+ANALYSIS_DEFINITIONS = {
+    "endpoint": "Confirmed successful exact-version timing artifact with T4x2 and submit_begin-to-start <=300 seconds.",
+    "buckets": "Two-hour Asia/Ho_Chi_Minh buckets and dates use actual submit_begin; skipped local opportunities use due separately.",
+    "resolved": "fast + slow (300<latency<=600) + over10 (latency>600) + confirmed failures; unresolved evidence stays unknown.",
+    "unknown": "Includes pending (age<=300s), overdue_unconfirmed, ambiguous and unrecognized outcomes. Elapsed time or a running observation alone does not confirm a late start or failure.",
+    "rates": "Per-account success_rate=fast/resolved; identification interval=[fast/attempted,(fast+unknown)/attempted]. Aggregate rates use equal configured-account weights; no-data accounts contribute [0,1] and make the point estimate unavailable.",
+    "wilson": "95% Wilson bounds on resolved independent Bernoulli trials only; descriptive diagnostic, not authoritative confidence for correlated account/day observations. Aggregate bounds average per-account diagnostics, not a pooled confidence interval.",
+    "percentiles": "p50/p90 use known confirmed successful T4x2 submit-to-start seconds only; failures and unresolved runs excluded. Aggregate percentiles describe pooled successful observations, not equal-account rates.",
+    "eligibility": "Each selected configured account needs >=20 resolved outcomes across >=7 resolved local dates in that bucket. No exact sparse ranking.",
+    "sampling": "Observed opportunities, attempts and local skips in a bounded recent window. Configured probe interval is 30, 60 or 120 minutes. Planning retains 30-minute strata; only the first UTC 30-minute window per configured interval is sampled, with other slots skipped as sampling_interval. GPU quota cannot be inferred.",
+    "heldout": "Preliminary, read-only, noncausal fast-rate diagnostic. Split actual local submission dates chronologically: earlier dates train, latest seven dates test; require at least seven training and seven heldout dates. Eligible training two-hour buckets select a time-window policy by equal-account resolved fast rate. Heldout selected-window rates are compared with the overall heldout baseline using equal configured-account weights and explicit unknown/no-data coverage. This is an observational covariate comparison, not a counterfactual decision evaluation, latency confidence estimate or causal savings estimate.",
+    "production": "Registration is metadata only. Caller timing is self-reported and excluded. Explicit authenticated verification can accept a complete exact-version provider-fetched queue-monitor-timing.json artifact with run_id matching registered event_id, observed ref, timestamps and T4x2. Optional artifact event_id must agree with run_id.",
+    "decision": "Descriptive p50/p90 Pareto comparison only, with a 30-second material margin in both metrics. No latency confidence estimate or statistical guarantee; fast-rate identification intervals are not latency evidence. Upcoming candidates use their actual local weekday/weekend; waiting+p50/p90 is conditional on confirmed successes, not a completion guarantee.",
+}
+
+
+def analysis_policy(collector):
+    return {**ANALYSIS_POLICY, "interval_minutes": collector.store.sampling_interval_minutes}
+
+
+def local_day_type(dt):
+    return "weekend" if dt.weekday() >= 5 else "weekday"
+
+
+def wilson(fast, resolved):
+    if not resolved:
+        return None, None
+    z = 1.959963984540054
+    p = fast / resolved
+    denominator = 1 + z * z / resolved
+    center = (p + z * z / (2 * resolved)) / denominator
+    radius = z * math.sqrt(p * (1 - p) / resolved + z * z / (4 * resolved ** 2)) / denominator
+    return max(0, center - radius), min(1, center + radius)
+
+
+def analysis_counts(runs, now):
+    counts = dict.fromkeys(("attempted", "resolved", "fast", "slow", "over10", "failures",
+                            "unknown", "pending", "overdue_unconfirmed", "skipped"), 0)
+    latencies, dates, resolved_dates, names, skip_reasons = [], set(), set(), set(), {}
+    for run in runs:
+        begin = run.get("submit_begin")
+        if begin is None:
+            if run["state"] == "skipped" and run["due"] <= now:
+                counts["skipped"] += 1
+                reason = run.get("skip_reason", "unspecified")
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+        counts["attempted"] += 1
+        date = datetime.fromtimestamp(begin, LOCAL).date().isoformat()
+        dates.add(date)
+        names.add(run["account"])
+        latency = run.get("start_latency_upper", run.get("start_latency_seconds"))
+        # Legacy probe success is persisted only after validate_timing. Production
+        # requires an explicit future provider verifier, never caller timing.
+        verified = run.get("source", "probe") == "probe" or run.get("evidence_provenance") == "provider_artifact"
+        known_success = (verified and run["state"] == "success" and run.get("t4x2") is True
+                         and isinstance(latency, (int, float)) and not isinstance(latency, bool)
+                         and math.isfinite(latency) and latency >= 0)
+        if known_success:
+            counts["fast" if latency <= 300 else "slow" if latency <= 600 else "over10"] += 1
+            latencies.append(latency)
+            counts["resolved"] += 1
+            resolved_dates.add(date)
+        elif run["state"] in {"failed", "wrong_gpu", "invalid_output", "cancelled"}:
+            counts["failures"] += 1
+            counts["resolved"] += 1
+            resolved_dates.add(date)
+        else:
+            counts["unknown"] += 1
+            if run["state"] in ACTIVE_STATES or run["state"] == "external_pending":
+                counts["pending" if now - begin <= 300 else "overdue_unconfirmed"] += 1
+    total, resolved = counts["attempted"], counts["resolved"]
+    low, high = wilson(counts["fast"], resolved)
+    eligible = resolved >= 20 and len(resolved_dates) >= 7
+    return {**counts, "success_rate": counts["fast"] / resolved if resolved else None,
+            "rate_lower": counts["fast"] / total if total else None,
+            "rate_upper": (counts["fast"] + counts["unknown"]) / total if total else None,
+            "wilson_low": low, "wilson_high": high,
+            "median_seconds": percentile(latencies, .5), "p90_seconds": percentile(latencies, .9),
+            "day_count": len(dates), "resolved_day_count": len(resolved_dates), "account_count": len(names),
+            "eligible": eligible, "reason": None if eligible else "insufficient_resolved" if resolved < 20 else "insufficient_days",
+            "skip_reasons": skip_reasons}
+
+
+def analysis_buckets(runs, configured, now, day_type="all", account=None):
+    names = [account] if account else sorted(configured)
+    entries = {hour: [] for hour in range(0, 24, 2)}
+    for run in runs:
+        if account and run["account"] != account:
+            continue
+        at = run.get("submit_begin")
+        if at is None:
+            if run["state"] != "skipped" or run["due"] > now:
+                continue
+            at = run["due"]
+        local = datetime.fromtimestamp(at, LOCAL)
+        if day_type != "all" and local_day_type(local) != day_type:
+            continue
+        entries[local.hour // 2 * 2].append(run)
+    result = []
+    for hour, rows in entries.items():
+        pooled = analysis_counts(rows, now)
+        per_account = [{"account": name, **analysis_counts([r for r in rows if r["account"] == name], now)}
+                       for name in sorted(set(names) | {r["account"] for r in rows})]
+        weighted = [r for r in per_account if r["account"] in names]
+        def average(key, no_data=None):
+            values = [r[key] if r[key] is not None else no_data for r in weighted]
+            return sum(values) / len(values) if values and all(v is not None for v in values) else None
+        if not account:
+            pooled.update(success_rate=average("success_rate"), rate_lower=average("rate_lower", 0),
+                          rate_upper=average("rate_upper", 1), wilson_low=average("wilson_low"),
+                          wilson_high=average("wilson_high"))
+        eligible = bool(weighted) and all(r["eligible"] for r in weighted)
+        missing = [r["account"] for r in weighted if not r["attempted"]]
+        result.append({**pooled, "hour_start": hour, "label": f"{hour:02d}:00–{hour+2:02d}:00",
+                       **({"account": account} if account else {}), "accounts": per_account,
+                       "eligible": eligible, "reason": None if eligible else "missing_account_coverage" if missing or not weighted else "insufficient_account_evidence",
+                       "coverage": {"configured": len(names), "observed": sum(bool(r["attempted"]) for r in weighted),
+                                    "missing_accounts": missing}, "weighting": "equal_account", "rank": None})
+    return result
+
+
+def analysis_window(collector, source):
+    store = collector.store
+    if source == "production":
+        with store.connect() as db:
+            rows = db.execute("SELECT data FROM production_events ORDER BY submit_begin DESC,event_id LIMIT ?",
+                              (SUMMARY_RUN_LIMIT + 1,)).fetchall()
+        runs = [json.loads(r[0]) for r in rows]
+    else:
+        runs = store.runs("state!='scheduled'", limit=SUMMARY_RUN_LIMIT + 1)
+    truncated = len(runs) > SUMMARY_RUN_LIMIT
+    runs = runs[:SUMMARY_RUN_LIMIT]
+    return runs, {"kind": "recent_source_records", "limit": SUMMARY_RUN_LIMIT, "count": len(runs),
+                  "truncated": truncated, "ordering": "submit_begin_desc" if source == "production" else "due_desc",
+                  "filters_applied_after_window": True, "all_history_retained": True}
+
+
+def build_decision(collector, runs, source, account, now, mode="earliest", horizon_hours=6, day_type="all"):
+    local = datetime.fromtimestamp(now, LOCAL)
+    boundary = local.replace(hour=local.hour // 2 * 2, minute=0, second=0, microsecond=0) + timedelta(hours=2)
+    times = [local]
+    while boundary.timestamp() <= now + horizon_hours * 3600:
+        times.append(boundary)
+        boundary += timedelta(hours=2)
+    candidates = []
+    by_day_type = {}
+    for at in times:
+        actual_type = local_day_type(at)
+        if day_type != "all" and actual_type != day_type:
+            continue
+        if actual_type not in by_day_type:
+            by_day_type[actual_type] = analysis_buckets(runs, collector.accounts, now, actual_type, account)
+        bucket = by_day_type[actual_type][at.hour // 2]
+        waiting = at.timestamp() - now
+        candidates.append({"at": iso(at.timestamp()), "local_at": at.isoformat(), "day_type": actual_type,
+                           "hour_start": bucket["hour_start"], "waiting_seconds": waiting,
+                           "total_p50_seconds": waiting + bucket["median_seconds"] if bucket["median_seconds"] is not None else None,
+                           "total_p90_seconds": waiting + bucket["p90_seconds"] if bucket["p90_seconds"] is not None else None,
+                           "accounts": [{"account": row["account"], "eligible": row["eligible"], "reason": row["reason"],
+                                         "total_p50_seconds": waiting + row["median_seconds"] if row["median_seconds"] is not None else None,
+                                         "total_p90_seconds": waiting + row["p90_seconds"] if row["p90_seconds"] is not None else None}
+                                        for row in bucket["accounts"]],
+                           "bucket": bucket})
+    decision = {"schema_version": 2, "generated_at": iso(now), "mode": mode, "source": source,
+                "account": account, "day_type": day_type, "horizon_hours": horizon_hours,
+                "status": "abstain", "reason": "insufficient_evidence", "recommended_at": None,
+                "certainty": "descriptive_only", "promise": False, "candidates": candidates,
+                "selection_basis": "descriptive_p50_p90_pareto", "material_margin_seconds": 30,
+                "limitations": ["no_latency_confidence", "no_statistical_guarantee", "confirmed_successes_only",
+                                "pooled_latency_percentiles_may_reflect_account_imbalance"]}
+    baseline = next((c for c in candidates if c["waiting_seconds"] == 0), None)
+    if mode == "earliest" and (baseline is None or not baseline["bucket"]["eligible"] or baseline["total_p50_seconds"] is None):
+        decision["reason"] = "missing_baseline"
+        return decision
+    if not candidates or any(not c["bucket"]["eligible"] or c["total_p50_seconds"] is None or c["total_p90_seconds"] is None for c in candidates):
+        return decision
+    metrics = ("total_p50_seconds", "total_p90_seconds")
+    margin = decision["material_margin_seconds"]
+    if len(candidates) == 1:
+        decision.update(status="tentative", reason="sole_eligible_candidate", recommended_at=candidates[0]["at"])
+        return decision
+    dominant = next((candidate for candidate in candidates
+                     if all(all(other[key] - candidate[key] >= margin for key in metrics)
+                            for other in candidates if other is not candidate)), None)
+    if dominant is not None:
+        decision.update(status="tentative", reason="historical_comparison", recommended_at=dominant["at"])
+        return decision
+    # Compare only latency totals. A median/tail conflict cannot be settled by
+    # unrelated endpoint-rate bounds or by lexicographic median ranking.
+    frontier = [candidate for candidate in candidates if not any(
+        all(other[key] <= candidate[key] for key in metrics) and any(other[key] < candidate[key] for key in metrics)
+        for other in candidates if other is not candidate)]
+    near_equivalent = any(all(abs(left[key] - right[key]) < margin for key in metrics)
+                          for left in frontier for right in candidates if left is not right)
+    frontier_conflict = any(max(c[key] for c in frontier) - min(c[key] for c in frontier) >= margin
+                            for key in metrics)
+    decision["reason"] = "equivalent" if near_equivalent and not frontier_conflict else "tradeoff"
+    return decision
+
+
+def heldout_sampling_diagnostic(runs, configured, now, account=None):
+    names = [account] if account else sorted(configured)
+    submitted = [r for r in runs if r.get("submit_begin") is not None and (account is None or r["account"] == account)]
+    def date_of(run):
+        return datetime.fromtimestamp(run["submit_begin"], LOCAL).date().isoformat()
+    dates = sorted({date_of(r) for r in submitted})
+    result = {"status": "unavailable", "reason": "insufficient_dates", "phase": "preliminary",
+              "metric": "fast_rate", "causal": False, "counterfactual": False, "savings_seconds": None,
+              "selection_basis": "training_equal_account_resolved_fast_rate",
+              "limitations": ["observational_covariate_comparison", "no_causal_savings", "no_latency_confidence",
+                              "selected_windows_are_subset_of_baseline", "bounded_recent_window"],
+              "min_training_days": 7, "min_heldout_days": 7,
+              "training_dates": [], "heldout_dates": [], "selected_hours": [],
+              "training_record_count": 0, "heldout_record_count": 0,
+              "selected": None, "baseline": None, "observed_rate_difference": None}
+    if len(dates) < 14:
+        return result
+    train_dates, test_dates = dates[:-7], dates[-7:]
+    train = [r for r in submitted if date_of(r) in train_dates]
+    test = [r for r in submitted if date_of(r) in test_dates]
+    result.update(training_dates=train_dates, heldout_dates=test_dates,
+                  training_record_count=len(train), heldout_record_count=len(test))
+    eligible = [b for b in analysis_buckets(train, configured, now, account=account)
+                if b["eligible"] and b["success_rate"] is not None]
+    if not eligible:
+        result["reason"] = "insufficient_training_bucket_evidence"
+        return result
+    top_rate = max(b["success_rate"] for b in eligible)
+    selected_hours = [b["hour_start"] for b in eligible if abs(b["success_rate"] - top_rate) < 1e-12]
+    selected = [r for r in test if datetime.fromtimestamp(r["submit_begin"], LOCAL).hour // 2 * 2 in selected_hours]
+    def weighted_counts(rows):
+        pooled = analysis_counts(rows, now)
+        accounts = [{"account": name, **analysis_counts([r for r in rows if r["account"] == name], now)} for name in names]
+        def average(key, absent=None):
+            values = [a[key] if a[key] is not None else absent for a in accounts]
+            return sum(values) / len(values) if values and all(v is not None for v in values) else None
+        return {**pooled, "accounts": accounts, "weighting": "equal_account",
+                "success_rate": average("success_rate"), "rate_lower": average("rate_lower", 0),
+                "rate_upper": average("rate_upper", 1), "wilson_low": average("wilson_low"), "wilson_high": average("wilson_high"),
+                "coverage": {"configured": len(names), "observed": sum(bool(a["attempted"]) for a in accounts),
+                             "missing_accounts": [a["account"] for a in accounts if not a["attempted"]],
+                             "resolved_accounts": sum(bool(a["resolved"]) for a in accounts)}}
+    baseline, selected_counts = weighted_counts(test), weighted_counts(selected)
+    result.update(selected_hours=selected_hours, training_selected_fast_rate=top_rate,
+                  baseline=baseline, selected=selected_counts)
+    if selected_counts["success_rate"] is None or baseline["success_rate"] is None:
+        result["reason"] = "insufficient_heldout_account_coverage"
+        return result
+    if any(a["day_count"] < 7 for a in selected_counts["accounts"]):
+        result["reason"] = "insufficient_selected_heldout_dates"
+        return result
+    result.update(status="available", reason="noncausal_observational_comparison",
+                  observed_rate_difference=selected_counts["success_rate"] - baseline["success_rate"])
+    return result
+
+
+def build_analysis(collector, source="probe", account=None, day_type="all", now=None):
+    now = time.time() if now is None else now
+    runs, window = analysis_window(collector, source)
+    buckets = analysis_buckets(runs, collector.accounts, now, day_type, account)
+    selected = []
+    for run in runs:
+        if account and run["account"] != account:
+            continue
+        if run.get("submit_begin") is None and (run["state"] != "skipped" or run["due"] > now):
+            continue
+        at = run.get("submit_begin", run["due"])
+        if at is None:
+            at = run["due"]
+        if day_type == "all" or local_day_type(datetime.fromtimestamp(at, LOCAL)) == day_type:
+            selected.append(run)
+    submits = [r["submit_begin"] for r in selected if r.get("submit_begin") is not None]
+    window.update(selected_count=len(selected), oldest_submit_utc=iso(min(submits)) if submits else None,
+                  newest_submit_utc=iso(max(submits)) if submits else None)
+    names = [account] if account else sorted(set(collector.accounts) | {r["account"] for r in selected})
+    return {"schema_version": 2, "generated_at": iso(now), "metric": "submit_to_start",
+            "timezone": "Asia/Ho_Chi_Minh", "definitions": ANALYSIS_DEFINITIONS,
+            "policy": analysis_policy(collector), "source": source, "account": account, "day_type": day_type,
+            "bucket_hours": 2, "statistics_window": window, "buckets": buckets,
+            "accounts": [{"account": name, "configured": name in collector.accounts,
+                          **analysis_counts([r for r in selected if r["account"] == name], now)} for name in names],
+            "sampling": {"phase": "preliminary", "observed_opportunities": sum(b["attempted"] + b["skipped"] for b in buckets),
+                         "attempted": sum(b["attempted"] for b in buckets), "skipped": sum(b["skipped"] for b in buckets),
+                         "known_successes": sum(b["fast"] + b["slow"] + b["over10"] for b in buckets),
+                         "day_count": len({datetime.fromtimestamp(at, LOCAL).date() for at in submits}),
+                         "interval_minutes": collector.store.sampling_interval_minutes, "quota_inferable": False,
+                         "recommendation": "collect_not_evaluate" if len({datetime.fromtimestamp(at, LOCAL).date() for at in submits}) < 14 else "review_heldout_diagnostic",
+                         "heldout": heldout_sampling_diagnostic(selected, collector.accounts, now, account)},
+            "decision": build_decision(collector, runs, source, account, now, day_type=day_type)}
+
+
+def validate_production_registration(payload, accounts, now):
+    required = {"event_id", "account", "requested_ref", "ref", "version", "submit_begin", "submit_ack", "accelerator", "push_outcome"}
+    if not isinstance(payload, dict) or not required <= payload.keys() or payload.keys() - required - {"timing"}:
+        raise ValueError("invalid_registration_fields")
+    if not isinstance(payload["event_id"], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", payload["event_id"]):
+        raise ValueError("invalid_event_id")
+    account, requested_ref, ref = payload["account"], payload["requested_ref"], payload["ref"]
+    if not isinstance(account, str) or account.lower() not in accounts:
+        raise ValueError("unregistered_account")
+    def valid_ref(value):
+        return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}/[A-Za-z0-9_-]{1,80}", value)
+    if (not valid_ref(requested_ref) or requested_ref.split("/")[0].lower() != account.lower()
+            or (ref is not None and not valid_ref(ref))):
+        raise ValueError("invalid_owned_ref")
+    if payload["accelerator"] != "NvidiaTeslaT4" or payload["push_outcome"] not in ("accepted", "ambiguous", "rejected"):
+        raise ValueError("invalid_submission_metadata")
+    if payload["push_outcome"] == "accepted" and ref != requested_ref:
+        raise ValueError("unconfirmed_returned_ref")
+    version = payload["version"]
+    if (version is not None and (isinstance(version, bool) or not isinstance(version, int) or version < 1)) or (payload["push_outcome"] == "accepted" and version is None):
+        raise ValueError("invalid_exact_version")
+    try:
+        begin = timestamp(payload["submit_begin"])
+        ack = timestamp(payload["submit_ack"]) if payload["submit_ack"] is not None else None
+        if not math.isfinite(begin) or begin > now + 5 or (ack is not None and not begin <= ack <= now + 5) or (ack is None and payload["push_outcome"] == "accepted"):
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        raise ValueError("invalid_submission_timestamps") from None
+    if "timing" in payload:
+        timing = payload["timing"]
+        if not isinstance(timing, dict) or set(timing) != {"start_utc", "end_utc", "gpu_names", "gpu_query_ok"}:
+            raise ValueError("invalid_reported_timing")
+        try:
+            start, end = timestamp(timing["start_utc"]), timestamp(timing["end_utc"])
+            names = timing["gpu_names"]
+            if not begin - 5 <= start <= end <= now + 5 or not isinstance(timing["gpu_query_ok"], bool) or not isinstance(names, list) or len(names) > 16 or not all(isinstance(n, str) and len(n) < 200 for n in names):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            raise ValueError("invalid_reported_timing") from None
+    return payload
+
+
+def matching_production_artifact(data, event_id, ref):
+    return (isinstance(data, dict) and data.get("run_id") == event_id
+            and ("event_id" not in data or data["event_id"] == event_id)
+            and data.get("ref") == ref and data.get("source", "production") == "production")
+
+
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, sampling_interval_minutes=None):
         self.path = str(path)
+        self.sampling_interval_minutes = configured_sampling_interval(sampling_interval_minutes)
+        # Monotonic counter bumped on every mutation; lets the HTTP layer cache
+        # an expensive summary and invalidate it precisely instead of reloading
+        # full history every 15 seconds.
+        self._version_lock = threading.Lock()
+        self.data_version = 0
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript('''
@@ -296,8 +747,61 @@ class Store:
                 CREATE TABLE IF NOT EXISTS calls (
                     id INTEGER PRIMARY KEY,run_id TEXT,operation TEXT,at REAL,
                     latency_ms REAL,ok INTEGER,http_status INTEGER,error TEXT);
+                CREATE TABLE IF NOT EXISTS production_events (
+                    event_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL,
+                    submit_begin REAL NOT NULL, data TEXT NOT NULL);
             ''')
             self._migrate_accounts(db)
+        self.bump()
+
+    def bump(self):
+        with self._version_lock:
+            self.data_version += 1
+            return self.data_version
+
+    def register_production(self, payload, now):
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        begin = timestamp(payload["submit_begin"])
+        run = {"id": "production:" + payload["event_id"], "account": payload["account"].lower(),
+               "source": "production", "due": begin, "submit_begin": begin,
+               "submit_ack": timestamp(payload["submit_ack"]) if payload["submit_ack"] is not None else None,
+               "requested_ref": payload["requested_ref"], "ref": payload["ref"], "event_id": payload["event_id"],
+               "version": payload["version"], "accelerator": payload["accelerator"],
+               "push_outcome": payload["push_outcome"], "state": "external_pending",
+               "active": False, "registered_at": now, "evidence_provenance": "registration_metadata",
+               "reported_timing": payload.get("timing"), "reported_timing_provenance": "self_reported" if "timing" in payload else None}
+        if payload["push_outcome"] == "rejected":
+            run["state"] = "failed"
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT payload_hash FROM production_events WHERE event_id=?", (payload["event_id"],)).fetchone()
+            if existing:
+                if not hmac.compare_digest(existing[0], digest):
+                    raise ValueError("event_id_payload_conflict")
+                return False
+            db.execute("INSERT INTO production_events VALUES (?,?,?,?)", (payload["event_id"], digest, begin, json.dumps(run)))
+        self.bump()
+        return True
+
+    def production_event(self, event_id):
+        with self.connect() as db:
+            row = db.execute("SELECT data FROM production_events WHERE event_id=?", (event_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def verify_production(self, event_id, evidence, now):
+        # Merge evidence without modifying the immutable registration hash or
+        # identity. Concurrent successful callbacks cannot erase caller metadata.
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM production_events WHERE event_id=?", (event_id,)).fetchone()
+            if not row:
+                raise ValueError("unknown_event_id")
+            run = json.loads(row[0])
+            run.update(evidence, state="success", active=False, evidence_provenance="provider_artifact",
+                       evidence_observed_at=now, provider_status="complete", artifact_filename="queue-monitor-timing.json")
+            db.execute("UPDATE production_events SET data=? WHERE event_id=?", (json.dumps(run), event_id))
+        self.bump()
+        return run
 
     @staticmethod
     def _migrate_accounts(db):
@@ -330,6 +834,7 @@ class Store:
         db.execute("CREATE UNIQUE INDEX one_active_account ON runs(account COLLATE NOCASE) WHERE active=1")
         db.execute("CREATE INDEX IF NOT EXISTS runs_due ON runs(state,due)")
         db.execute("CREATE INDEX IF NOT EXISTS runs_schedule_key ON runs(account COLLATE NOCASE,window,slot)")
+        db.execute("CREATE INDEX IF NOT EXISTS runs_summary_due ON runs(due DESC,position) WHERE state!='scheduled'")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -348,24 +853,70 @@ class Store:
 
     def plan(self, now, usernames):
         current = int(now // 1800) * 1800
+        interval_seconds = self.sampling_interval_minutes * 60
+        changed = False
+        # Interval changes operate only on unsubmitted scheduled slots. Keep all
+        # attempts/active jobs and never revive a skipped historical opportunity.
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute("SELECT value FROM meta WHERE key='sampling_interval_minutes'").fetchone()
+            previous_interval = json.loads(previous[0]) if previous else 30
+            if previous_interval != self.sampling_interval_minutes:
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('next_window',?)", (json.dumps(current),))
+                changed = True
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('sampling_interval_minutes',?)", (json.dumps(self.sampling_interval_minutes),))
+            for row in db.execute("SELECT id,data FROM runs WHERE state='scheduled'").fetchall():
+                run = json.loads(row["data"])
+                if run["window"] % interval_seconds:
+                    run.update(state="skipped", skip_reason="sampling_interval", sampling_interval_minutes=self.sampling_interval_minutes)
+                    db.execute("UPDATE runs SET state='skipped',active=0,data=? WHERE id=?", (json.dumps(run), row["id"]))
+                    changed = True
         cursor = self.get_meta("next_window", current)
-        # Bounded work per tick, but persist every missed window on restart.
-        for window in range(cursor, min(current + 1800, cursor + 96 * 1800), 1800):
+        # Plan through the *next* window so a next_probe time is always visible
+        # before its window opens. Missed windows are still persisted (bounded
+        # to 96) but launch throttling prevents a catch-up burst.
+        # Include the next eligible interval even when intervening 30m windows
+        # are deliberately suppressed, so next_probe remains visible.
+        next_sample_window = int(now // interval_seconds) * interval_seconds + interval_seconds
+        horizon = min(next_sample_window + 1800, cursor + 96 * 1800)
+        created = changed
+        for window in range(cursor, horizon, 1800):
             with self.connect() as db:
                 for item in stratified_plan(window, usernames):
-                    item.update(id=uuid.uuid4().hex, state="scheduled")
-                    db.execute('''INSERT INTO runs
+                    suppressed = window % interval_seconds != 0
+                    item.update(id=uuid.uuid4().hex, state="skipped" if suppressed else "scheduled",
+                                sampling_interval_minutes=self.sampling_interval_minutes)
+                    if suppressed:
+                        item["skip_reason"] = "sampling_interval"
+                    created = db.execute('''INSERT INTO runs
                         SELECT ?,?,?,?,?,?,?,0,?
-                        WHERE NOT EXISTS (SELECT 1 FROM runs WHERE account=? COLLATE NOCASE AND window=? AND slot=?)''',
-                               (item["id"], item["account"], window, item["slot"], item["due"], item["position"], "scheduled", json.dumps(item),
-                                item["account"], window, item["slot"]))
+                        WHERE NOT EXISTS (SELECT 1 FROM runs WHERE account=? COLLATE NOCASE AND window=?)''',
+                               (item["id"], item["account"], window, item["slot"], item["due"], item["position"], item["state"], json.dumps(item),
+                                item["account"], window)).rowcount == 1 or created
                 db.execute("INSERT OR REPLACE INTO meta VALUES ('next_window',?)", (json.dumps(window + 1800),))
+        if created:
+            self.bump()
 
     def runs(self, where="1", args=(), limit=None):
         with self.connect() as db:
             rows = db.execute(f"SELECT data FROM runs WHERE {where} ORDER BY due DESC,position" +
                               (" LIMIT ?" if limit else ""), (*args, limit) if limit else args).fetchall()
             return [json.loads(r[0]) for r in rows]
+
+    def state_occupancy(self):
+        """Counts every persisted row by state, independent of the recent-200
+        sample, so live occupancy always includes active runs outside the cut."""
+        with self.connect() as db:
+            by_state = {r["state"]: r["c"] for r in db.execute(
+                "SELECT state, count(*) AS c FROM runs GROUP BY state")}
+            active = {r["state"]: r["c"] for r in db.execute(
+                "SELECT state, count(*) AS c FROM runs WHERE active=1 GROUP BY state")}
+        return by_state, active
+
+    def next_probes(self, now):
+        with self.connect() as db:
+            return {r["account"]: r["due"] for r in db.execute(
+                "SELECT account,min(due) AS due FROM runs WHERE state='scheduled' AND due>=? GROUP BY account", (now,))}
 
     def save(self, run, active=None):
         canonical_run(run)
@@ -374,6 +925,7 @@ class Store:
         with self.connect() as db:
             db.execute("UPDATE runs SET account=?,state=?,active=?,data=? WHERE id=?",
                        (run["account"], run["state"], int(active), json.dumps(run), run["id"]))
+        self.bump()
 
     def claim(self, run, now):
         canonical_run(run)
@@ -382,10 +934,13 @@ class Store:
                    next_poll=now, errors=0, version=None)
         try:
             with self.connect() as db:
-                return db.execute("UPDATE runs SET account=?,state='pushing',active=1,data=? WHERE id=? AND state='scheduled'",
-                                  (run["account"], json.dumps(run), run["id"])).rowcount == 1
+                claimed = db.execute("UPDATE runs SET account=?,state='pushing',active=1,data=? WHERE id=? AND state='scheduled'",
+                                     (run["account"], json.dumps(run), run["id"])).rowcount == 1
         except sqlite3.IntegrityError:
             return False
+        if claimed:
+            self.bump()
+        return claimed
 
     def call(self, run_id, operation, started, result):
         with self.connect() as db:
@@ -506,9 +1061,18 @@ def helper(operation: str):
                                and matching_probe_source(blob.source, payload["id"], payload.get("probe_ref", payload["ref"])))
                     result = {"ok": True, "data": {**diagnostic, "matched": matched}}
                 else:
+                    production = operation == "production_output"
+                    if production and (payload.get("source") != "production"
+                                       or not isinstance(payload.get("event_id"), str)
+                                       or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", payload["event_id"])
+                                       or not isinstance(payload.get("ref"), str)
+                                       or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}/[A-Za-z0-9_-]{1,80}", payload["ref"])):
+                        raise ValueError("Invalid production identity")
                     owner, slug = payload["ref"].split("/")
                     version = payload["version"]
-                    if isinstance(version, bool) or not isinstance(version, int) or version < 1 or slug != SLUG:
+                    if (isinstance(version, bool) or not isinstance(version, int) or version < 1
+                            or (not production and slug != SLUG)
+                            or (production and owner.lower() != os.getenv("KAGGLE_USERNAME", "").lower())):
                         raise ValueError("Invalid identity")
                     cls = ApiGetKernelSessionStatusRequest if operation == "status" else ApiListKernelSessionOutputRequest
                     request = cls()
@@ -520,17 +1084,27 @@ def helper(operation: str):
                     request.version_label = f"v{version}"
                     with api.build_kaggle_client() as client:
                         endpoint = client.kernels.kernels_api_client
+                        if production:
+                            status_request = ApiGetKernelSessionStatusRequest()
+                            status_request.user_name, status_request.kernel_slug = owner, slug
+                            status_request.version_label = f"v{version}"
+                            status_response = endpoint.get_kernel_session_status(status_request)
+                            status = parse_status(getattr(status_response.status, "name", str(status_response.status)))
+                            if status != "complete" or bool(status_response.failure_message):
+                                result = {"ok": True, "data": {"status": status, "requested_version": version, "timing": None}}
+                                # No artifact fetch, no fabricated terminal failure.
                         if operation == "status":
                             response = endpoint.get_kernel_session_status(request)
                             status = getattr(response.status, "name", str(response.status))
                             result = {"ok": True, "data": {"status": status, "failure": bool(response.failure_message),
                                                             "requested_version": version}}
-                        elif operation == "output":
+                        elif operation in ("output", "production_output") and (not production or (status == "complete" and not status_response.failure_message)):
                             # Do not use kernels_output: it also retrieves logs. Fetch
                             # ONLY timing.json from the exact version's file listing.
                             request.page_size = 100
                             response = endpoint.list_kernel_session_output(request)
-                            files = [f for f in response.files or [] if f and f.file_name == "timing.json"]
+                            filename = "queue-monitor-timing.json" if production else "timing.json"
+                            files = [f for f in response.files or [] if f and f.file_name == filename]
                             if len(files) != 1:
                                 raise ValueError("Timing artifact unavailable")
                             import requests
@@ -543,8 +1117,13 @@ def helper(operation: str):
                                         raise ValueError("Artifact too large")
                             data = json.loads(body)
                             data["fetched_version"] = version
-                            result = {"ok": True, "data": data}
-                        else:
+                            if production:
+                                if not matching_production_artifact(data, payload["event_id"], payload["ref"]):
+                                    raise ValueError("Foreign production artifact")
+                                result = {"ok": True, "data": {"status": "complete", "requested_version": version, "timing": data}}
+                            else:
+                                result = {"ok": True, "data": data}
+                        elif not production:
                             raise ValueError("Unknown operation")
         except Exception as exc:
             response = getattr(exc, "response", None)
@@ -586,6 +1165,36 @@ class InstanceLock:
             self.file.close()
 
 
+class SummaryCache:
+    """Short-lived, version-invalidated cache for the expensive summary build.
+
+    All history stays in SQLite; this only avoids reloading it on every 15-second
+    dashboard refresh. Any store mutation bumps the version and invalidates it.
+    """
+
+    def __init__(self, ttl=10.0):
+        self.ttl = max(0.0, ttl)
+        self._lock = threading.Lock()
+        self._value = None
+        self._version = -1
+        self._at = 0.0
+
+    def get(self, version, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            if (self._value is not None and self._version == version
+                    and now - self._at < self.ttl):
+                return self._value
+        return None
+
+    def put(self, version, value, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            self._value = value
+            self._version = version
+            self._at = now
+
+
 class Collector:
     def __init__(self, store, accounts, auto=False, transport=None):
         self.store = store
@@ -595,49 +1204,207 @@ class Collector:
         self.auto, self.transport = auto, transport or Transport()
         self.stop = threading.Event()
         self.thread = None
+        self.watchdog_thread = None
+        self.watchdog_started = False
         self.ready = False
+        self.sdk_ready = False
         self.readiness = {"ok": False, "error": "not_checked"}
+        self.readiness_attempts = 0
+        self.readiness_next = 0.0
+        self.readiness_backoff = READINESS_BACKOFF_INITIAL
         self.heartbeat = None
         self.last_error = None
+        self.fatal_reason = None
+        self.progress = "starting"
+        self.started_at = None
+        self.tick_started = None
+        self.tick_finished = None
+        self.calls_in_flight = 0
+        self.api_in_flight = False
+        self.api_started = None
+        self.api_last_started = None
+        self.api_last_end = None
+        self.api_last_http_status = None
+        self.call_timeout = float(getattr(self.transport, "timeout", 0) or DEFAULT_CALL_TIMEOUT)
+        # Bounded shutdown grace: one tick can make at most two bounded remote
+        # calls (one poll + one push).
+        self.shutdown_grace = max(10.0, self.call_timeout * 2 + WATCHDOG_CALL_MARGIN_SECONDS)
+        self.summary_cache = SummaryCache(ttl=float(os.getenv("SUMMARY_CACHE_SECONDS", "10") or 10))
+        self._exit_hook = None  # Tests may intercept the process-exit watchdog.
+
+    def _invoke(self, operation, payload, account=None):
+        started = time.time()
+        self.calls_in_flight += 1
+        self.api_in_flight = True
+        self.api_started = started
+        self.api_last_started = started
+        try:
+            result = self.transport.invoke(operation, payload, account)
+            if not isinstance(result, dict):
+                result = {"ok": False, "error": "helper_protocol"}
+        except Exception as exc:
+            # A transport that raises unexpectedly is a bounded failed attempt,
+            # not a reason to lose the worker or the persisted run.
+            result = {"ok": False, "error": type(exc).__name__}
+        finally:
+            self.calls_in_flight -= 1
+            self.api_in_flight = self.calls_in_flight > 0
+            self.api_last_started = started
+            self.api_last_end = time.time()
+            self.api_last_http_status = result.get("http_status")
+        return result
 
     def call(self, run, operation):
-        started = time.time()
-        result = self.transport.invoke(operation, run, self.accounts[run["account"]])
-        self.store.call(run["id"], operation, started, result)
-        run["last_api_begin"] = started
-        run["last_api_end"] = time.time()
-        run["last_api_latency_ms"] = (time.time() - started) * 1000
+        account = self.accounts.get(run["account"])
+        if account is None:
+            # Removed account: report an attempt error but never fabricate a
+            # terminal state or release the remote job. The run stays blocked.
+            started = time.time()
+            result = {"ok": False, "error": "account_removed"}
+            self.api_last_started, self.api_last_end = started, time.time()
+        else:
+            result = self._invoke(operation, run, account)
+        try:
+            self.store.call(run["id"], operation, self.api_last_started, result)
+        except Exception:
+            pass  # Call telemetry must never break recovery.
+        run["last_api_begin"] = self.api_last_started
+        run["last_api_end"] = self.api_last_end
+        run["last_api_latency_ms"] = (self.api_last_end - self.api_last_started) * 1000
         run["last_api_http_status"] = result.get("http_status")
         return result
 
     def start(self):
+        self.started_at = time.time()
         # Persisted pushing means the remote save may already have happened.
         for run in self.store.runs("state='pushing'"):
             run.update(state="ambiguous", error="restart_during_push", next_poll=time.time() + 60)
             self.store.save(run)
         self.thread = threading.Thread(target=self.loop, name="queue-collector", daemon=True)
         self.thread.start()
+        self.watchdog_thread = threading.Thread(target=self.watchdog, name="queue-watchdog", daemon=True)
+        self.watchdog_thread.start()
+        self.watchdog_started = True
 
     def loop(self):
-        self.readiness = self.transport.invoke("check", {})
-        self.ready = self.readiness.get("ok", False) and bool(self.accounts)
         while not self.stop.is_set():
-            try:
-                self.heartbeat = time.time()
-                self.tick(self.heartbeat)
-                self.last_error = None
-            except Exception as exc:
-                self.last_error = type(exc).__name__
+            if self.watchdog_started and not self.watchdog_thread.is_alive():
+                self.fatal("watchdog_thread_dead")
+                return
+            self._iteration()
             self.stop.wait(1)
 
+    def _iteration(self):
+        now = time.time()
+        self.tick_started = now
+        try:
+            # The initial SDK check runs inside the guarded loop so a cold or
+            # slow SDK can never kill the worker thread.
+            self.check_readiness(now)
+            self.ready = self.sdk_ready and bool(self.accounts) and not self.stop.is_set()
+            self.tick(time.time())
+            self.tick_finished = time.time()
+            self.heartbeat = self.tick_finished
+            self.progress = "ok"
+            self.last_error = None
+            # Readiness needs a completed tick: a never-progressing worker is
+            # idle and must not report ready.
+            self.ready = self.sdk_ready and bool(self.accounts) and not self.stop.is_set()
+        except Exception as exc:
+            self.ready = False
+            self.last_error = type(exc).__name__
+            self.progress = "error"
+
+    def check_readiness(self, now):
+        if now < self.readiness_next:
+            return
+        self.readiness_attempts += 1
+        result = self._invoke("check", {})
+        self.readiness = result
+        completed = max(now, self.api_last_end)
+        if result.get("ok"):
+            self.sdk_ready = True
+            self.readiness_backoff = READINESS_BACKOFF_INITIAL
+            self.readiness_next = completed + READINESS_RECHECK_SECONDS
+        else:
+            self.sdk_ready = False
+            delay = self.readiness_backoff
+            self.ready = False
+            self.readiness_next = completed + delay
+            self.readiness_backoff = min(READINESS_BACKOFF_MAX, delay * 2)
+
+    def worker_stuck(self, now):
+        """True only when progress is impossible within any bounded call."""
+        if self.calls_in_flight > 0:
+            return (now - (self.api_started if self.api_started is not None else now)) > self.call_timeout + WATCHDOG_CALL_MARGIN_SECONDS
+        # A completed bounded call is progress too: readiness + poll + push can
+        # share one iteration, without a finished tick between those calls.
+        refs = [value for value in (self.tick_finished, self.started_at, self.api_last_end) if value is not None]
+        ref = max(refs) if refs else None
+        if ref is None:
+            ref = self.tick_started
+        if ref is None:
+            return False
+        return (now - ref) > self.call_timeout * 2 + WATCHDOG_CALL_MARGIN_SECONDS
+
+    def watchdog_check(self, now):
+        if self.stop.is_set() or self.thread is None:
+            return None
+        if not self.thread.is_alive():
+            return "worker_thread_dead"
+        if self.worker_stuck(now):
+            return "worker_stuck"
+        return None
+
+    def watchdog(self):
+        while not self.stop.wait(WATCHDOG_INTERVAL_SECONDS):
+            reason = self.watchdog_check(time.time())
+            if reason:
+                self.fatal(reason)
+                return
+
+    def fatal(self, reason):
+        """Terminate only on an irrecoverable worker failure so Docker restarts.
+        No remote/queued job is ever cancelled by this path."""
+        self.fatal_reason = reason
+        self.ready = False
+        self.progress = "fatal"
+        self.stop.set()
+        if self._exit_hook is not None:
+            self._exit_hook(1)
+            return
+        os._exit(1)
+
+    def shutdown(self, grace=None):
+        """Bounded shutdown. Returns True only when the worker actually stopped."""
+        self.stop.set()
+        self.ready = False
+        grace = self.shutdown_grace if grace is None else grace
+        if self.thread is not None:
+            self.thread.join(timeout=grace)
+        if self.watchdog_thread is not None:
+            self.watchdog_thread.join(timeout=5)
+        return not (self.thread is not None and self.thread.is_alive())
+
+    def recover_interrupted_pushes(self, now):
+        # A persisted 'pushing' row at tick start means a previous attempt was
+        # interrupted before its outcome was saved. Reconcile, never re-push.
+        for run in self.store.runs("state='pushing'"):
+            run.update(state="ambiguous", error="unexpected_push_interruption",
+                       next_poll=now + 60)
+            self.store.save(run)
+
     def tick(self, now):
+        if self.stop.is_set():
+            return
+        self.recover_interrupted_pushes(now)
         self.store.plan(now, list(self.accounts))
         # One remote call per tick: fair earliest-due polling across accounts.
         polling = sorted((r for r in self.store.runs("active=1")
                           if r["state"] != "pushing"
                           and r["account"] in self.accounts and r.get("next_poll", 0) <= now),
                          key=lambda r: r.get("next_poll", 0))
-        if polling:
+        if polling and not self.stop.is_set():
             self.poll(polling[0], now)
         last_launch = self.store.get_meta("last_launch", 0)
         due = sorted(self.store.runs("state='scheduled' AND due<=?", (now,)),
@@ -645,6 +1412,8 @@ class Collector:
         launched = False
         busy = {r["account"] for r in self.store.runs("active=1")}
         for run in due:
+            if self.stop.is_set():
+                break
             # Polling can take up to CALL_TIMEOUT; don't launch an expired slot
             # based on the timestamp taken before that blocking subprocess.
             decision_time = max(now, time.time())
@@ -665,32 +1434,46 @@ class Collector:
             elif not launched and decision_time - last_launch >= 15 and not self.stop.is_set():
                 if self.store.claim(run, decision_time):
                     self.store.set_meta("last_launch", decision_time)
-                    result = self.call(run, "push")
-                    run["push_end"] = run["last_api_end"]
-                    run["push_response_received"] = result.get("ok") is True
-                    run["submit_ack_uncertain"] = not run["push_response_received"]
-                    data = result.get("data")
-                    if isinstance(data, dict):
-                        run["push_response"] = push_diagnostic(data)
-                    try:
-                        if not result["ok"]:
-                            raise ValueError("Ambiguous push")
-                        if isinstance(data, dict) and data.get("error") is True:
-                            # Explicit save rejection, not an HTTP timeout or
-                            # missing identity, proves this attempt was rejected.
-                            run.update(state="failed", error="provider_push_rejected", terminal_observed=run["push_end"])
-                            self.store.save(run)
-                            self.store.set_meta("last_launch", run["push_end"])
-                            launched = True
-                            continue
-                        version = parse_push(result["data"], run["ref"])
-                        run.update(state="submitted", version=version, submit_ack=run["push_end"], next_poll=time.time() + 15)
-                    except (ValueError, KeyError, TypeError):
-                        run.update(state="ambiguous", error=result.get("error", "push_identity_unconfirmed"), next_poll=time.time() + 60)
-                    self.store.save(run)
-                    self.store.set_meta("last_launch", max(decision_time, time.time()))
                     launched = True
                     busy.add(run["account"])
+                    self.push(run, decision_time)
+
+    def push(self, run, decision_time):
+        try:
+            result = self.call(run, "push")
+            run["push_end"] = run["last_api_end"]
+            run["push_response_received"] = result.get("ok") is True
+            run["submit_ack_uncertain"] = not run["push_response_received"]
+            data = result.get("data")
+            if isinstance(data, dict):
+                run["push_response"] = push_diagnostic(data)
+            try:
+                if not result["ok"]:
+                    raise ValueError("Ambiguous push")
+                if isinstance(data, dict) and data.get("error") is True:
+                    # Explicit save rejection, not an HTTP timeout or missing
+                    # identity, proves this attempt was rejected.
+                    run.update(state="failed", error="provider_push_rejected",
+                               terminal_observed=run["push_end"])
+                else:
+                    version = parse_push(result["data"], run["ref"])
+                    run.update(state="submitted", version=version, submit_ack=run["push_end"],
+                               next_poll=time.time() + 15)
+            except (ValueError, KeyError, TypeError):
+                run.update(state="ambiguous", error=result.get("error", "push_identity_unconfirmed"),
+                           next_poll=time.time() + 60)
+            self.store.save(run)
+        except Exception:
+            # Unexpected failure after the claim: the remote save may already
+            # have happened, so reconcile rather than re-push.
+            run.update(state="ambiguous", error="push_call_exception",
+                       next_poll=time.time() + 60)
+            self.store.save(run)
+        # The outcome is durable now. Bookkeeping failure must surface through
+        # the guarded iteration, never downgrade confirmed identity or reactivate
+        # an explicitly rejected run as ambiguous.
+        self.store.set_meta("last_launch", run["push_end"] if run["state"] == "failed"
+                            else max(decision_time, time.time()))
 
     def reconcile(self, run):
         # Freeze the original push completion observation BEFORE this read call
@@ -739,7 +1522,8 @@ class Collector:
                 raise ValueError(result.get("error", "api_failure"))
             if operation == "output":
                 evidence = validate_timing(result["data"], run, time.time())
-                run.update(evidence, state="success" if evidence["t4x2"] else "wrong_gpu")
+                run.update(evidence, state="success" if evidence["t4x2"] else "wrong_gpu",
+                           evidence_observed_at=time.time())
                 if run.pop("over_600_observation", False):
                     run["historical_over_600_observation"] = True
                 run.pop("error", None)
@@ -768,9 +1552,14 @@ class Collector:
                 run["state"] = "submitted"
             elif status == "complete":
                 run.update(state="collecting", terminal_observed=observed)
-            else:
-                run.update(state="failed", terminal_observed=observed, error="provider_" + status)
-            if status in {"running", *TERMINAL} and run.get("first_queued") is not None:
+            elif status == "cancelled":
+                # An acknowledged cancellation is terminal. This is the only
+                # transition that maps to the explicit cancelled state.
+                run.update(state="cancelled", terminal_observed=observed)
+                run.pop("error", None)
+            else:  # status == "error"
+                run.update(state="failed", terminal_observed=observed, error="provider_error")
+            if status in {"running", *PROVIDER_TERMINAL} and run.get("first_queued") is not None:
                 transition = run.get("first_running", observed)
                 run["queue_upper_seconds"] = max(0, transition - run["submit_begin"])
                 run["queue_lower_seconds"] = max(0, run.get("last_queued_request_begin", run["first_queued"]) - run["first_queued"])
@@ -786,8 +1575,178 @@ class Collector:
         self.store.save(run)
 
 
+def logic_graph(by_state: dict, active_by_state: dict) -> dict:
+    """Canonical, read-only runtime graph with live occupancy.
+
+    Occupancy is counted over every persisted row, so an active run older than
+    the recent-200 summary sample is still represented here.
+    """
+    nodes = []
+    for state in sorted(APP_STATES):
+        nodes.append({
+            "id": state, "kind": "app_state", "label": state,
+            "active": state in ACTIVE_STATES, "terminal": state in TERMINAL_STATES,
+            "description": APP_STATE_DESCRIPTIONS[state],
+            "occupancy": int(by_state.get(state, 0)),
+            "active_occupancy": int(active_by_state.get(state, 0)),
+        })
+    nodes.append({
+        "id": "provider", "kind": "remote", "label": "Kaggle provider",
+        "active": False, "terminal": False, "occupancy": None, "active_occupancy": None,
+        "description": "Remote Kaggle kernels/session status. Polled read-only; cancellation unsupported.",
+    })
+    edges = [{"from": source, "to": target, "description": description}
+             for source, target, description in LOGIC_EDGES]
+    occupancy = {
+        "total": int(sum(by_state.values())),
+        "active_total": int(sum(active_by_state.values())),
+        "by_state": {k: int(v) for k, v in sorted(by_state.items())},
+        "active_by_state": {k: int(v) for k, v in sorted(active_by_state.items())},
+    }
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "occupancy": occupancy, "counts": occupancy,
+    }
+
+
+def roadmap_snapshot() -> dict:
+    """Read the locally packaged roadmap.json. Never calls GitHub."""
+    override = os.getenv("ROADMAP_JSON")
+    path = Path(override) if override else Path(__file__).with_name("roadmap.json")
+    if not path.is_file():
+        return {"available": False, "reason": "roadmap_json_not_packaged",
+                "source": "local_roadmap_json", "snapshot": None}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("repo"), str) or not isinstance(payload.get("synced_at"), str):
+            raise ValueError("Invalid roadmap snapshot")
+        if not all(isinstance(payload.get(key), list) for key in ("issues", "dependencies", "blocked")):
+            raise ValueError("Invalid roadmap collections")
+        for issue in payload["issues"]:
+            if not isinstance(issue, dict) or type(issue.get("number")) is not int or not all(
+                    isinstance(issue.get(key), str) for key in ("title", "state", "url", "body", "updatedAt")):
+                raise ValueError("Invalid roadmap issue")
+        if not all(isinstance(edge, dict) and type(edge.get("from")) is int and type(edge.get("to")) is int
+                   for edge in payload["dependencies"]) or not all(type(number) is int for number in payload["blocked"]):
+            raise ValueError("Invalid roadmap dependencies")
+    except (OSError, ValueError):
+        return {"available": False, "reason": "roadmap_json_unreadable",
+                "source": "local_roadmap_json", "snapshot": None}
+    return {"available": True, "reason": None, "source": "local_roadmap_json",
+            "snapshot": payload}
+
+
+def build_summary(collector: Collector, config_error, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    store = collector.store
+    runs = store.runs("state!='scheduled'", limit=SUMMARY_RUN_LIMIT)
+    pending = store.next_probes(now)
+    active = {r["account"]: r for r in store.runs("active=1")}
+    accounts = []
+    for name in sorted(set(collector.accounts) | set(active)):
+        account_runs = [r for r in runs if r["account"] == name]
+        latest = active.get(name) or (account_runs[0] if account_runs else None)
+        sampled = [r for r in account_runs if r.get("submit_begin") is not None]
+        latest_sample = sampled[0] if sampled else None
+        state = active[name]["state"] if name in active else "idle"
+        accounts.append({"id": name, "name": name, "username": name,
+                         "status": frontend_status(state), "state": state,
+                         "sample_count": len(sampled),
+                         "day_count": len({datetime.fromtimestamp(r["due"], LOCAL).date() for r in sampled}),
+                         "active_runs": int(name in active),
+                         "blocked": int(name in active),
+                         "queue_estimate_seconds": queue_estimate(latest_sample) if latest_sample else None,
+                         "queue_lower_seconds": latest_sample.get("queue_lower_seconds") if latest_sample else None,
+                         "queue_upper_seconds": latest_sample.get("queue_upper_seconds") if latest_sample else None,
+                         "updated_at": iso(latest_sample.get("last_observed", latest_sample["submit_begin"])) if latest_sample else None,
+                         "active_run_id": active[name]["id"] if name in active else None,
+                         "latest_run": frontend_run(latest) if latest else None,
+                         "next_probe_utc": iso(pending[name]) if name in pending else None})
+    with store.connect() as db:
+        calls = [dict(r) for r in db.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 200")]
+    min_days = max(1, int(os.getenv("MIN_RANK_DAYS", "3")))
+    hours = hourly_stats(runs, min_days)
+    sample_count = sum(r.get("submit_begin") is not None for r in runs)
+    day_count = len({datetime.fromtimestamp(r["due"], LOCAL).date() for r in runs if r.get("submit_begin") is not None})
+    generated_at = iso(now)
+    # Evidence freshness is distinct from the timestamp of this HTTP response
+    # and from the latest API attempt or the worker heartbeat.
+    updates = [r[key] for r in runs + list(active.values()) for key in ("submit_ack", "last_observed", "terminal_observed", "evidence_observed_at", "end")
+               if r.get(key) is not None]
+    heartbeat = iso(collector.heartbeat) if collector.heartbeat is not None else None
+    last_api_attempt = iso(collector.api_last_started) if collector.api_last_started is not None else (iso(calls[0]["at"]) if calls else None)
+    alive = bool(collector.thread and collector.thread.is_alive())
+    healthy = alive and not collector.last_error and collector.fatal_reason is None
+    meta = {"schema_version": SCHEMA_VERSION,
+            "health": "ok" if healthy else "error", "timezone": "Asia/Ho_Chi_Minh",
+            "stale_after_seconds": 2400,
+            "data_updated_at": iso(max(updates)) if updates else None,
+            "evidence_updated_at": iso(max(updates)) if updates else None,
+            "heartbeat": heartbeat, "heartbeat_utc": heartbeat,
+            "last_api_attempt_utc": last_api_attempt,
+            "api_in_flight": collector.api_in_flight,
+            "config_ok": config_error is None, "configuration_error": config_error,
+            "sdk_ready": collector.sdk_ready, "worker_alive": alive,
+            "sample_count": sample_count, "day_count": day_count,
+            "statistics_window": {"kind": "recent_runs", "limit": SUMMARY_RUN_LIMIT,
+                                  "count": len(runs), "oldest_due_utc": iso(runs[-1]["due"]) if runs else None,
+                                  "newest_due_utc": iso(runs[0]["due"]) if runs else None,
+                                  "all_history_retained": True,
+                                  "cache_ttl_seconds": collector.summary_cache.ttl},
+            "auto_probes": collector.auto, "ready": collector.ready,
+            "cancellation_supported": False,
+            "success_5m_metric": "confirmed T4x2 submit-to-start upper bound <=300 seconds / all attempted submissions"}
+    return {"schema_version": SCHEMA_VERSION,
+            "meta": meta, "hours": hours, "timezone": "Asia/Ho_Chi_Minh", "generated_at": generated_at,
+            "auto_probes": collector.auto, "ready": collector.ready,
+            "accounts": accounts, "runs": [frontend_run(r) for r in runs[:200]], "hourly": hours,
+            "api_calls": calls, "minimum_rank_days": min_days,
+            "statistics": {"day_count": day_count, "sample_count": sample_count,
+                           "total_runs": len(runs), "skipped": sum(r["state"] == "skipped" for r in runs)},
+            "definitions": {"latency": "probe UTC start minus push request begin; bounds include push API latency",
+                            "queue": "queue_estimate_seconds is the conservative observed queue upper bound, not a measured duration; missed queued or still queued has no estimate",
+                            "rate": "submit-to-start: definite <=300s successful T4x2 / all attempted submissions, including ambiguity and failures",
+                            "percentiles": "median_queue_seconds and p90_seconds use known observed queue upper-bound estimates across submitted outcomes; submit_to_start_p50/p90_seconds use successful T4x2 only; recent-run window in meta.statistics_window, local-hour buckets",
+                            "unacceptable": "observed queue lower bound >600 seconds; submit_to_start_unacceptable is a separate latency flag",
+                            "timeout": "observation alert only; account remains blocked until confirmed terminal"}}
+
+
+def live_health(collector, config_error):
+    now = time.time()
+    alive = bool(collector.thread and collector.thread.is_alive())
+    stuck = collector.watchdog_check(now)
+    watchdog_alive = not collector.watchdog_started or collector.watchdog_thread.is_alive()
+    healthy = alive and watchdog_alive and stuck is None and not collector.last_error and collector.fatal_reason is None and not collector.stop.is_set()
+    ready = bool(healthy and collector.ready and collector.sdk_ready and config_error is None)
+    return {
+        "schema_version": SCHEMA_VERSION, "ok": bool(healthy), "ready": ready,
+        "worker_alive": alive, "watchdog_alive": watchdog_alive,
+        "auto_probes": collector.auto,
+        "heartbeat_utc": iso(collector.heartbeat) if collector.heartbeat is not None else None,
+        "tick_started_utc": iso(collector.tick_started) if collector.tick_started is not None else None,
+        "tick_finished_utc": iso(collector.tick_finished) if collector.tick_finished is not None else None,
+        "api_in_flight": collector.api_in_flight,
+        "last_api_attempt_utc": iso(collector.api_last_started) if collector.api_last_started is not None else None,
+        "last_api_result_utc": iso(collector.api_last_end) if collector.api_last_end is not None else None,
+        "sdk_ready": collector.sdk_ready, "config_ok": config_error is None,
+        "configuration_error": config_error, "worker_error": collector.last_error,
+        "progress": collector.progress, "watchdog": stuck,
+        "fatal_reason": collector.fatal_reason, "readiness_attempts": collector.readiness_attempts,
+        "readiness": collector.readiness,
+    }
+
+
+def refresh_summary_health(payload, collector, config_error):
+    health = live_health(collector, config_error)
+    return {**payload, "ready": health["ready"], "meta": {
+        **payload["meta"], **health, "health": "ok" if health["ok"] else "error",
+        "heartbeat": health["heartbeat_utc"],
+    }}
+
+
 def create_app():
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException, Header, Body, Query
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     from dotenv import dotenv_values
@@ -797,6 +1756,7 @@ def create_app():
         path = Path(os.getenv("MONITOR_DB", str(Path(__file__).with_name("monitor.sqlite3")))).resolve()
         lock = InstanceLock(path)
         lock.acquire()
+        app.state.instance_lock = lock
         collector = None
         try:
             config_error = None
@@ -813,89 +1773,162 @@ def create_app():
                 config_error = "accounts_env_not_set"
             collector = Collector(Store(path), accounts, os.getenv("AUTO_PROBES", "false").lower() == "true",
                                   Transport(max(5, min(120, float(os.getenv("CALL_TIMEOUT", "45"))))))
+            collector.instance_lock = lock
             app.state.collector = collector
             app.state.config_error = config_error
+            app.state.ingest_token = os.getenv("MONITOR_INGEST_TOKEN", "")
             collector.start()
             yield
         finally:
             if collector:
-                collector.stop.set()
-                # Keep the process lock until all in-flight subprocess work ends.
                 import asyncio
-                await asyncio.to_thread(collector.thread.join)
-            lock.release()
+                # Bounded join. If the worker will not stop within the grace, do
+                # NOT release the process lock: let the process exit release the
+                # OS lock rather than allow a second instance to start.
+                stopped = await asyncio.to_thread(collector.shutdown)
+                if stopped:
+                    lock.release()
+            else:
+                lock.release()
 
     app = FastAPI(title="Kaggle Queue Monitor", lifespan=lifespan)
+
+    def collector_health(collector) -> dict:
+        result = live_health(collector, app.state.config_error)
+        return result, result["ok"]
 
     @app.get("/healthz")
     def health():
         collector = app.state.collector
-        alive = collector.thread.is_alive()
-        healthy = alive and not collector.last_error
-        return JSONResponse({"ok": healthy, "worker_alive": alive, "ready": collector.ready,
-                             "auto_probes": collector.auto, "heartbeat_utc": iso(collector.heartbeat) if collector.heartbeat else None,
-                             "configuration_error": app.state.config_error, "worker_error": collector.last_error,
-                             "readiness": collector.readiness}, status_code=200 if healthy else 503)
+        body, healthy = collector_health(collector)
+        return JSONResponse(body, status_code=200 if healthy else 503)
 
     @app.get("/api/summary")
     def summary():
         collector = app.state.collector
         store = collector.store
-        runs = store.runs("state!='scheduled'")
-        pending = store.runs("state='scheduled'")
-        active = {r["account"]: r for r in store.runs("active=1")}
-        accounts = []
-        for name in sorted(set(collector.accounts) | set(active)):
-            account_runs = [r for r in runs if r["account"] == name]
-            latest = account_runs[0] if account_runs else None
-            sampled = [r for r in account_runs if r.get("submit_begin") is not None]
-            latest_sample = sampled[0] if sampled else None
-            future = [r["due"] for r in pending if r["account"] == name]
-            state = active[name]["state"] if name in active else "idle"
-            accounts.append({"id": name, "name": name, "username": name,
-                             "status": frontend_status(state), "state": state,
-                             "sample_count": len(sampled),
-                             "day_count": len({datetime.fromtimestamp(r["due"], LOCAL).date() for r in sampled}),
-                             "active_runs": int(name in active),
-                             "queue_estimate_seconds": queue_estimate(latest_sample) if latest_sample else None,
-                             "queue_lower_seconds": latest_sample.get("queue_lower_seconds") if latest_sample else None,
-                             "queue_upper_seconds": latest_sample.get("queue_upper_seconds") if latest_sample else None,
-                             "updated_at": iso(latest_sample.get("last_observed", latest_sample["submit_begin"])) if latest_sample else None,
-                             "active_run_id": active[name]["id"] if name in active else None,
-                             "latest_run": frontend_run(latest) if latest else None,
-                             "next_probe_utc": iso(min(future)) if future else None})
-        with store.connect() as db:
-            calls = [dict(r) for r in db.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 200")]
-        min_days = max(1, int(os.getenv("MIN_RANK_DAYS", "3")))
-        hours = hourly_stats(runs, min_days)
-        sample_count = sum(r.get("submit_begin") is not None for r in runs)
-        day_count = len({datetime.fromtimestamp(r["due"], LOCAL).date() for r in runs if r.get("submit_begin") is not None})
-        generated_at = iso(time.time())
-        # Collection freshness is distinct from the timestamp of this HTTP response.
-        updates = [r[key] for r in runs for key in ("submit_begin", "submit_ack", "last_observed", "last_api_end", "end")
-                   if r.get(key) is not None]
-        heartbeat = iso(collector.heartbeat) if collector.heartbeat is not None else None
-        healthy = collector.thread.is_alive() and not collector.last_error
-        meta = {"health": "ok" if healthy else "error", "timezone": "Asia/Ho_Chi_Minh",
-                "stale_after_seconds": 2400,
-                "data_updated_at": iso(max(updates)) if updates else None,
-                "heartbeat": heartbeat, "heartbeat_utc": heartbeat,
-                "sample_count": sample_count, "day_count": day_count,
-                "auto_probes": collector.auto, "ready": collector.ready,
+        version = store.data_version
+        cached = collector.summary_cache.get(version)
+        if cached is not None:
+            return refresh_summary_health(cached, collector, app.state.config_error)
+        payload = build_summary(collector, app.state.config_error)
+        collector.summary_cache.put(version, payload)
+        return refresh_summary_health(payload, collector, app.state.config_error)
+
+    def analysis_filters(source, account, day_type):
+        if source not in ("probe", "production") or day_type not in ("all", "weekday", "weekend"):
+            raise HTTPException(422, "invalid_analysis_filter")
+        if account is not None:
+            account = account.lower()
+            if account not in app.state.collector.accounts:
+                raise HTTPException(422, "unregistered_account")
+        return account
+
+    @app.get("/api/analysis")
+    def analysis(source: str = "probe", account: str | None = None, day_type: str = "all"):
+        account = analysis_filters(source, account, day_type)
+        return build_analysis(app.state.collector, source, account, day_type)
+
+    @app.get("/api/decision")
+    def decision(mode: str = "earliest", horizon_hours: int = Query(6, ge=1, le=48),
+                 source: str = "probe", account: str | None = None, day_type: str = "all"):
+        account = analysis_filters(source, account, day_type)
+        if mode not in ("earliest", "schedule"):
+            raise HTTPException(422, "invalid_decision_mode")
+        collector = app.state.collector
+        runs, window = analysis_window(collector, source)
+        return {**build_decision(collector, runs, source, account, time.time(), mode, horizon_hours, day_type),
+                "statistics_window": window, "metric": "submit_to_start", "policy": analysis_policy(collector),
+                "definitions": ANALYSIS_DEFINITIONS}
+
+    def authenticate_ingest(x_monitor_token):
+        token = app.state.ingest_token
+        if not token:
+            raise HTTPException(503, "production_ingest_disabled")
+        if not hmac.compare_digest(x_monitor_token.encode(), token.encode()):
+            raise HTTPException(401, "invalid_monitor_token")
+
+    @app.post("/api/production/register")
+    def production_register(payload: dict = Body(...), x_monitor_token: str = Header("")):
+        authenticate_ingest(x_monitor_token)
+        try:
+            validate_production_registration(payload, app.state.collector.accounts, time.time())
+            created = app.state.collector.store.register_production(payload, time.time())
+        except ValueError as exc:
+            reason = str(exc)
+            raise HTTPException(409 if reason == "event_id_payload_conflict" else 422, reason) from None
+        return {"schema_version": 2, "event_id": payload["event_id"], "created": created,
+                "source": "production", "evidence_provenance": "registration_metadata",
+                "primary_timing_accepted": False, "polled": False, "blocks_probe": False}
+
+    @app.post("/api/production/verify")
+    def production_verify(payload: dict = Body(...), x_monitor_token: str = Header("")):
+        authenticate_ingest(x_monitor_token)
+        if set(payload) not in ({"event_id"}, {"id"}):
+            raise HTTPException(422, "invalid_verification_fields")
+        event_id = payload.get("event_id", payload.get("id"))
+        if not isinstance(event_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", event_id):
+            raise HTTPException(422, "invalid_event_id")
+        collector = app.state.collector
+        run = collector.store.production_event(event_id)
+        if run is None:
+            raise HTTPException(404, "unknown_event_id")
+        response = {"schema_version": 2, "event_id": event_id, "source": "production", "verified": False,
+                    "state": run["state"], "evidence_provenance": run["evidence_provenance"], "blocks_probe": False}
+        if run["evidence_provenance"] == "provider_artifact":
+            return {**response, "verified": True, "reason": "already_verified"}
+        account = collector.accounts.get(run["account"])
+        if account is None:
+            return {**response, "reason": "unregistered_account"}
+        # Never promote requested identity, a timeout, or an uncertain version
+        # into a confirmed provider identity. Legacy registrations may lack it.
+        if (run["push_outcome"] != "accepted" or run.get("ref") != run.get("requested_ref")
+                or not isinstance(run.get("version"), int) or isinstance(run["version"], bool) or run["version"] < 1):
+            return {**response, "reason": "unconfirmed_submission_identity"}
+        try:
+            fetched = collector.transport.invoke("production_output", {
+                "source": "production", "ref": run["ref"], "version": run["version"], "event_id": event_id}, account)
+            if not isinstance(fetched, dict) or fetched.get("ok") is not True:
+                return {**response, "reason": "provider_evidence_unavailable"}
+            data = fetched["data"]
+            if (data.get("status") != "complete" or type(data.get("requested_version")) is not int
+                    or data["requested_version"] != run["version"]):
+                return {**response, "reason": "exact_version_not_complete"}
+            timing = data.get("timing")
+            if not isinstance(timing, dict):
+                return {**response, "reason": "provider_evidence_unavailable"}
+            if (not matching_production_artifact(timing, event_id, run["ref"])
+                    or type(timing.get("fetched_version")) is not int):
+                return {**response, "reason": "invalid_provider_artifact"}
+            evidence = validate_timing(timing, {**run, "id": event_id}, time.time())
+            if not evidence["t4x2"]:
+                return {**response, "reason": "invalid_provider_artifact"}
+        except Exception:
+            # Network, SDK, artifact and clock errors leave registration unknown;
+            # never expose remote exception text, URLs or credentials.
+            return {**response, "reason": "provider_evidence_unavailable"}
+        verified = collector.store.verify_production(event_id, evidence, time.time())
+        return {**response, "verified": True, "state": verified["state"],
+                "evidence_provenance": "provider_artifact", "reason": "exact_version_artifact_validated"}
+
+    @app.get("/api/logic")
+    def logic():
+        collector = app.state.collector
+        by_state, active_by_state = collector.store.state_occupancy()
+        graph = logic_graph(by_state, active_by_state)
+        return {"schema_version": SCHEMA_VERSION, "generated_at": iso(time.time()),
+                "states": sorted(APP_STATES), "active_states": sorted(ACTIVE_STATES),
+                "terminal_states": sorted(TERMINAL_STATES),
+                "provider_states": sorted(PROVIDER_STATES),
                 "cancellation_supported": False,
-                "success_5m_metric": "confirmed T4x2 submit-to-start upper bound <=300 seconds / all attempted submissions"}
-        return {"meta": meta, "hours": hours, "timezone": "Asia/Ho_Chi_Minh", "generated_at": generated_at,
-                 "auto_probes": collector.auto, "ready": collector.ready,
-                "accounts": accounts, "runs": [frontend_run(r) for r in runs[:200]], "hourly": hours,
-                "api_calls": calls, "minimum_rank_days": min_days,
-                "statistics": {"day_count": day_count, "sample_count": sample_count,
-                               "total_runs": len(runs), "skipped": sum(r["state"] == "skipped" for r in runs)},
-                "definitions": {"latency": "probe UTC start minus push request begin; bounds include push API latency",
-                                "queue": "queue_estimate_seconds is the conservative observed queue upper bound, not a measured duration; missed queued or still queued has no estimate",
-                                "rate": "submit-to-start: definite <=300s successful T4x2 / all attempted submissions, including ambiguity and failures",
-                                "percentiles": "median_queue_seconds and p90_seconds use known observed queue upper-bound estimates across all submitted outcomes; submit_to_start_p50/p90_seconds use successful T4x2 only; all-history local-hour buckets",
-                                "unacceptable": "observed queue lower bound >600 seconds; submit_to_start_unacceptable is a separate latency flag",
-                                "timeout": "observation alert only; account remains blocked until confirmed terminal"}}
+                "notes": "Read-only canonical graph. Occupancy counts every persisted row; "
+                         "active runs older than the recent-200 sample are still included.",
+                **graph}
+
+    @app.get("/api/roadmap")
+    def roadmap():
+        snapshot = roadmap_snapshot()
+        return {"schema_version": SCHEMA_VERSION, "generated_at": iso(time.time()), **snapshot}
 
     static = Path(__file__).with_name("static")
     app.mount("/static", StaticFiles(directory=str(static), check_dir=False), name="static")

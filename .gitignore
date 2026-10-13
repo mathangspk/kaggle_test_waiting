@@ -14,3 +14,5 @@ secrets/
 .opencode/
 opencode.json
 TEAM-HANDOFF.md
+node_modules/
+dist/

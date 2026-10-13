@@ -1,5 +1,48 @@
 # Deployment evidence — 2026-10-12
 
+## Allocation semantics release — 2026-10-13
+
+- Issues #14–#17 implement actual-submission 2-hour buckets, distinct pending/
+  unknown/failure outcomes, account-weighted rates, source filters, minimum
+  resolved-date coverage and uncertainty diagnostics.
+- Primary visuals now use submit-to-start, with queue bounds secondary.
+  Descriptive decisions compare waiting plus P50/P90; conflicts or insufficient
+  evidence abstain. Probability bounds never stand in for latency confidence.
+- Production wrapper supports immutable input by default, optional temporary-copy
+  instrumentation, durable one-push receipts, upload-only retry and explicit
+  authenticated exact-version provider artifact verification. Real generated
+  artifact integration is covered with mocked provider transport; no production
+  job launched and no live production timing falsely claimed.
+- Final checks: 209 Python tests (178 backend, 31 wrapper) passed in deployed
+  Python 3.12; frontend 59 tests/typecheck/build passed. Independent QA confirmed
+  fixes for weighted-rate, decision-contract, artifact nonce and receipt identity
+  mismatches. Sampling interval supports 30/60/120 minutes, default unchanged.
+- Online SQLite backup checked before upgrade. Live analysis and decision APIs
+  healthy, historical samples retained, production source empty and unranked.
+- Source publication is authorized for this release; credentials and runtime
+  data remain excluded from Git.
+
+## Roadmap release — 2026-10-13
+
+- Issues #11, #12 and #13 completed and the packaged roadmap synchronized.
+- React/TypeScript dashboard serves six Vietnamese pages via the existing 8443
+  Tailscale URL. React Flow is read-only and exposes state descriptions, actual
+  occupancy and accessible alternative node controls. Mobile 390px viewport and
+  all page routes verified in the live browser.
+- 88 backend tests passed in the deployed Python 3.12 container; final edge-label
+  clarification also passed all 88 tests locally. 20 frontend tests, TypeScript
+  and production build passed. Docker's final npm install reports zero audited
+  vulnerabilities after reviewed dependency upgrades.
+- Guarded readiness retry, worker watchdog, next-window schedules, bounded
+  summary queries/cache and durable push outcome recovery implemented. Independent
+  QA fault injection found a terminal-rejection reactivation bug; regression fixed.
+- A consistent online SQLite backup passed integrity checking before final
+  upgrades. Persistent production history retained; final health confirms worker,
+  watchdog and SDK ready, four accounts loaded and 179 submitted samples at check.
+- Cancellation remains unsupported pending #4 native session identity evidence.
+- Release source is local and deployed, with publication authorized; credentials
+  and runtime data remain excluded from Git.
+
 ## Verified
 
 - GitHub roadmap #10 and implementation issues #1–#9 created.

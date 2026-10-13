@@ -1,0 +1,137 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+@source "./**/*.{ts,tsx}";
+
+/* Keep shadcn's v3 utility sizing during the v4 compiler migration. */
+@theme {
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --blur-sm: 4px;
+}
+
+@layer base {
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 213 76% 40%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 94%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 94%;
+    --muted-foreground: 215 16% 42%;
+    --accent: 210 40% 92%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 72% 46%;
+    --destructive-foreground: 210 40% 98%;
+    --success: 158 64% 32%;
+    --success-foreground: 0 0% 100%;
+    --warning: 33 92% 35%;
+    --warning-foreground: 0 0% 100%;
+    --border: 214 32% 88%;
+    --input: 214 32% 88%;
+    --ring: 213 76% 40%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 219 44% 8%;
+    --foreground: 214 40% 96%;
+    --card: 218 40% 12%;
+    --card-foreground: 214 40% 96%;
+    --popover: 218 40% 12%;
+    --popover-foreground: 214 40% 96%;
+    --primary: 210 100% 72%;
+    --primary-foreground: 219 44% 10%;
+    --secondary: 217 33% 19%;
+    --secondary-foreground: 214 40% 96%;
+    --muted: 217 33% 18%;
+    --muted-foreground: 215 22% 68%;
+    --accent: 217 33% 20%;
+    --accent-foreground: 214 40% 96%;
+    --destructive: 350 82% 68%;
+    --destructive-foreground: 219 44% 10%;
+    --success: 158 62% 60%;
+    --success-foreground: 219 44% 10%;
+    --warning: 39 92% 68%;
+    --warning-foreground: 219 44% 10%;
+    --border: 217 30% 24%;
+    --input: 217 30% 26%;
+    --ring: 210 100% 72%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  :focus-visible {
+    @apply outline-hidden ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+/* React Flow: keep the read-only graph legible in both themes without a CDN. */
+.react-flow__attribution {
+  display: none;
+}
+
+.react-flow__node {
+  font-family: inherit;
+}
+
+.react-flow__handle {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.react-flow__controls-button {
+  @apply border-border bg-card text-foreground;
+}
+
+.react-flow__controls-button svg {
+  fill: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.react-flow__minimap {
+  @apply rounded-md border border-border;
+}
+
+/* Slightly denser scrollbars for the sidebar and long tables. */
+.nice-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
+}
+
+.nice-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.nice-scroll::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--border));
+  border-radius: 9999px;
+}
+
+.nice-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}

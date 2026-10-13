@@ -45,3 +45,58 @@ Pause new probes: change compose `AUTO_PROBES` to `false` and recreate service.
 Already submitted runs continue to be tracked; Docker stop does not cancel them.
 Back up the named SQLite volume before migration; do not use `down -v`.
 Local dedicated SSH key is `monitor/.deploy/server_ed25519`, excluded from Git.
+
+## Roadmap dashboard
+
+The React/TypeScript frontend uses local shadcn-style Radix primitives and React
+Flow for a read-only state map. Docker builds it with Node 22, then copies static
+assets into the Python image; Node is not a production runtime service.
+
+Pages: Overview, Hours, Runs, Roadmap, Logic, Operations. Hash routes support
+direct links (for example `/#/logic`). Refresh is bounded at 15 seconds, aborts
+overlapping work and retains the last successful snapshot after errors.
+
+`python sync_roadmap.py` refreshes the packaged GitHub issue snapshot using `gh`.
+Rebuild/deploy after syncing. The browser shows snapshot time and marks it stale
+after 24 hours; runtime never needs a GitHub token. `/api/roadmap` and `/api/logic`
+expose that snapshot and the canonical runtime graph. Logic counts cover all
+persisted states, not only the latest 200 table rows.
+
+Summary statistics use the latest 5,000 non-scheduled rows with an explicit
+window; historical rows remain retained. A 10-second cache reduces repeated
+computation. Worker watchdog, guarded readiness retry and 220-second Docker stop
+grace cover bounded-call recovery and safe restart. Missing-account credentials
+never prove remote termination or release an unresolved active job.
+
+Frontend checks: `npm ci`, `npm test`, `npm run build` in `frontend/`.
+Backend checks remain `python -m pytest tests -q`.
+
+## Allocation analysis release
+
+`/api/analysis` uses actual submission time, 2-hour Vietnam buckets and explicit
+probe/production sources. Pending outcomes are unknown, not failed. Equal-account
+rates preserve missing-account uncertainty; eligibility requires 20 resolved
+attempts across 7 resolved dates per configured account and bucket. Wilson
+diagnostics assume independent observations and are not a guarantee for correlated
+Kaggle probes. Median/P90 remain pooled successful-run descriptive quantiles.
+
+`/api/decision` compares waiting + successful historical P50/P90. Recommendations
+are descriptive only: both totals must dominate alternatives by 30 seconds.
+Conflicting or near-equal totals abstain. Fast-rate bounds are not latency
+confidence. Missing baseline or candidate evidence also abstains.
+
+Production tracking instructions: [PRODUCTION_TRACKING.md](PRODUCTION_TRACKING.md).
+Registration and verification require `MONITOR_INGEST_TOKEN`, stored in server
+`.env` with owner-only permissions. Deployment preserves an existing secret or
+creates one without printing it. Use the same secret on a trusted submitting
+machine. Registration alone never supplies verified start timing; opt-in copied
+instrumentation plus explicit exact-version artifact verification are necessary.
+No real production notebook was launched to test this release.
+
+Balanced probe sampling accepts `SAMPLING_INTERVAL_MINUTES=30|60|120`, default 30.
+The scheduler retains 30-minute strata and suppresses extra windows at longer
+intervals, recording `sampling_interval` skips. It never deletes history or
+releases active remote jobs when the interval changes. Four accounts have at
+most 192/96/48 scheduled opportunities per day respectively, not guaranteed runs.
+Sampling diagnostics withhold utility evaluation until separate training and
+held-out date coverage exists. Comparisons are observational, not causal savings.

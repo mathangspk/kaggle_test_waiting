@@ -4,10 +4,17 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
+    # One worker tick can make at most two bounded remote calls (one poll + one
+    # push). The app joins its worker for up to 2 * CALL_TIMEOUT + 30s watchdog
+    # margin = 210s (CALL_TIMEOUT=90). Give Docker headroom beyond that bound so
+    # the worker finishes and the instance lock is released before SIGKILL.
+    stop_grace_period: 220s
     environment:
       AUTO_PROBES: "true"
       MIN_RANK_DAYS: "3"
       CALL_TIMEOUT: "90"
+      MONITOR_INGEST_TOKEN: "${MONITOR_INGEST_TOKEN:-}"
+      SAMPLING_INTERVAL_MINUTES: "${SAMPLING_INTERVAL_MINUTES:-30}"
     volumes:
       - monitor-data:/data
       - ./secrets/accounts.env:/run/secrets/accounts.env:ro

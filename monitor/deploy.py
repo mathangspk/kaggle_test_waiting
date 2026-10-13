@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import time
 import sys
+import secrets
 import paramiko
 from dotenv import dotenv_values
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -26,8 +27,8 @@ def run(command, sudo=False, timeout=600):
     if sudo:
         stdin.write(PASSWORD + '\n')
         stdin.flush()
-    code = stdout.channel.recv_exit_status()
     text = stdout.read().decode() + stderr.read().decode()
+    code = stdout.channel.recv_exit_status()
     print(text.replace(PASSWORD, '[redacted]'))
     if code:
         raise RuntimeError('Remote command failed: ' + str(code))
@@ -35,8 +36,22 @@ def run(command, sudo=False, timeout=600):
 try:
     run('mkdir -p ' + REMOTE + '/static ' + REMOTE + '/secrets; chmod 700 ' + REMOTE + '/secrets')
     sftp = client.open_sftp()
-    for name in ['app.py', 'requirements.txt', 'Dockerfile', 'compose.yaml', '.dockerignore', 'static/index.html']:
+    for name in ['app.py', 'requirements.txt', 'Dockerfile', 'compose.yaml', '.dockerignore', 'roadmap.json']:
         sftp.put(str(BASE / name), REMOTE + '/' + name)
+    def upload_tree(local, remote):
+        try:
+            sftp.mkdir(remote)
+        except IOError:
+            pass
+        for item in local.iterdir():
+            if item.name in {'node_modules', 'dist', '.git', '__pycache__', 'tests'}:
+                continue
+            target = remote + '/' + item.name
+            if item.is_dir():
+                upload_tree(item, target)
+            else:
+                sftp.put(str(item), target)
+    upload_tree(BASE / 'frontend', REMOTE + '/frontend')
     values = dotenv_values(os.environ['SOURCE_ACCOUNTS_ENV'], interpolate=False)
     count = int(values['PRODUCTION_KAGGLE_ACCOUNT_COUNT'])
     lines = ['PRODUCTION_KAGGLE_ACCOUNT_COUNT=' + str(count)]
@@ -50,6 +65,13 @@ try:
     with sftp.open(REMOTE + '/secrets/accounts.env', 'w') as f:
         f.write('\n'.join(lines) + '\n')
     sftp.chmod(REMOTE + '/secrets/accounts.env', 0o600)
+    # Preserve an existing ingest secret; keep it out of build context and logs.
+    try:
+        sftp.stat(REMOTE + '/.env')
+    except IOError:
+        with sftp.open(REMOTE + '/.env', 'w') as f:
+            f.write('MONITOR_INGEST_TOKEN=' + secrets.token_urlsafe(48) + '\n')
+        sftp.chmod(REMOTE + '/.env', 0o600)
     keydir = BASE / '.deploy'
     keydir.mkdir(exist_ok=True)
     private_path = keydir / 'server_ed25519'
