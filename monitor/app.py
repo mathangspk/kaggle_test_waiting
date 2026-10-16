@@ -40,6 +40,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from starlette.requests import Request
 
 UTC = timezone.utc
 LOCAL = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -726,6 +727,29 @@ def matching_production_artifact(data, event_id, ref):
             and data.get("ref") == ref and data.get("source", "production") == "production")
 
 
+def validate_production_attachment(payload, accounts):
+    if not isinstance(payload, dict) or not {"event_id", "account", "ref", "version"} <= payload.keys() or payload.keys() - {"event_id", "account", "ref", "version", "script_version_id"}:
+        raise ValueError("invalid_attachment_fields")
+    if not isinstance(payload["event_id"], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", payload["event_id"]):
+        raise ValueError("invalid_event_id")
+    account, ref = payload["account"], payload["ref"]
+    if not isinstance(account, str) or account.lower() not in accounts:
+        raise ValueError("unregistered_account")
+    if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}/[A-Za-z0-9_-]{1,80}", ref) or ref.split("/")[0].lower() != account.lower():
+        raise ValueError("invalid_owned_ref")
+    if type(payload["version"]) is not int or payload["version"] < 1:
+        raise ValueError("invalid_exact_version")
+    if "script_version_id" in payload and (type(payload["script_version_id"]) is not int or payload["script_version_id"] < 1):
+        raise ValueError("invalid_script_version_id")
+
+
+def production_identity_confirmed(run):
+    return (run.get("identity_attached") or run.get("push_outcome") == "accepted") and (
+        isinstance(run.get("ref"), str) and run["ref"] == run.get("requested_ref")
+        and run["ref"].split("/")[0].lower() == run["account"]
+        and type(run.get("version")) is int and run["version"] > 0)
+
+
 class Store:
     def __init__(self, path, sampling_interval_minutes=None):
         self.path = str(path)
@@ -749,8 +773,31 @@ class Store:
                     latency_ms REAL,ok INTEGER,http_status INTEGER,error TEXT);
                 CREATE TABLE IF NOT EXISTS production_events (
                     event_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL,
-                    submit_begin REAL NOT NULL, data TEXT NOT NULL);
+                    submit_begin REAL, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS activity_evidence (
+                    account TEXT NOT NULL, source TEXT NOT NULL, data TEXT NOT NULL,
+                    PRIMARY KEY(account,source));
+                CREATE TABLE IF NOT EXISTS production_poll_queue (
+                    event_id TEXT PRIMARY KEY, account TEXT NOT NULL,
+                    next_poll REAL NOT NULL, last_attempt REAL NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS production_poll_due ON production_poll_queue(next_poll);
+                CREATE INDEX IF NOT EXISTS production_poll_account ON production_poll_queue(account);
+                CREATE TABLE IF NOT EXISTS production_poll_accounts (
+                    account TEXT PRIMARY KEY, last_attempt REAL NOT NULL);
             ''')
+            # Old registrations required submission times; attachments do not.
+            if any(r["name"] == "submit_begin" and r["notnull"] for r in db.execute("PRAGMA table_info(production_events)")):
+                db.executescript('''ALTER TABLE production_events RENAME TO production_events_old;
+                    CREATE TABLE production_events (event_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL,
+                        submit_begin REAL, data TEXT NOT NULL);
+                    INSERT INTO production_events SELECT * FROM production_events_old;
+                    DROP TABLE production_events_old;''')
+            for row in db.execute("SELECT event_id,data FROM production_events").fetchall():
+                run = json.loads(row["data"])
+                if run["state"] not in TERMINAL_STATES:
+                    db.execute("INSERT OR IGNORE INTO production_poll_queue(event_id,account,next_poll) VALUES (?,?,?)",
+                               (row["event_id"], run["account"], run.get("next_poll", 0)))
+            db.commit()
             self._migrate_accounts(db)
         self.bump()
 
@@ -758,6 +805,41 @@ class Store:
         with self._version_lock:
             self.data_version += 1
             return self.data_version
+
+    def record_activity(self, account, source, observations, coverage, observed_at, *,
+                        error=None, auth_error=None, stale_after_seconds=300):
+        if coverage not in {"full", "partial", "none"} or not source or not account:
+            raise ValueError("invalid_activity_snapshot")
+        if not math.isfinite(observed_at) or not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+            raise ValueError("invalid_activity_timestamp_or_ttl")
+        for observation in observations:
+            if (not observation.get("identity") or observation.get("run_type") not in {"probe", "production", "interactive", "unknown"}
+                    or observation.get("state") not in {"running", "pending", "unresolved", "terminal"}
+                    or "provider_state" not in observation or not isinstance(observation.get("observed_at"), str)):
+                raise ValueError("invalid_activity_observation")
+            # ISO serialization rounds to microseconds; allow only that rounding.
+            if timestamp(observation["observed_at"]) > observed_at + 0.000001:
+                raise ValueError("future_activity_observation")
+        account = account.lower()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM activity_evidence WHERE account=? AND source=?", (account, source)).fetchone()
+            previous = json.loads(row[0]) if row else {}
+            if previous.get("last_attempt_at") and timestamp(previous["last_attempt_at"]) > observed_at:
+                return False
+            failed = bool(error or auth_error)
+            snapshot = {"account": account, "source": source, "coverage": "none" if failed else coverage,
+                        "observed_at": previous.get("observed_at") if failed else iso(observed_at),
+                        "last_attempt_at": iso(observed_at), "error": error, "auth_error": auth_error,
+                        "stale_after_seconds": stale_after_seconds,
+                        "observations": previous.get("observations", []) if failed else observations}
+            db.execute("INSERT OR REPLACE INTO activity_evidence VALUES (?,?,?)", (account, source, json.dumps(snapshot, allow_nan=False)))
+        self.bump()
+        return True
+
+    def activity_evidence(self):
+        with self.connect() as db:
+            return [json.loads(r[0]) for r in db.execute("SELECT data FROM activity_evidence ORDER BY account,source")]
 
     def register_production(self, payload, now):
         digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
@@ -780,6 +862,8 @@ class Store:
                     raise ValueError("event_id_payload_conflict")
                 return False
             db.execute("INSERT INTO production_events VALUES (?,?,?,?)", (payload["event_id"], digest, begin, json.dumps(run)))
+            if run["state"] not in TERMINAL_STATES:
+                db.execute("INSERT INTO production_poll_queue(event_id,account,next_poll) VALUES (?,?,?)", (payload["event_id"], run["account"], now))
         self.bump()
         return True
 
@@ -787,6 +871,91 @@ class Store:
         with self.connect() as db:
             row = db.execute("SELECT data FROM production_events WHERE event_id=?", (event_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def attach_production(self, payload, now):
+        account = payload["account"].lower()
+        owner, slug = payload["ref"].split("/")
+        ref = owner.lower() + "/" + slug
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM production_events WHERE event_id=?", (payload["event_id"],)).fetchone()
+            if row:
+                run = json.loads(row[0])
+                requested_owner, requested_slug = run["requested_ref"].split("/")
+                if run["account"] != account or requested_owner.lower() + "/" + requested_slug != ref or run.get("push_outcome") == "rejected":
+                    raise ValueError("attachment_identity_conflict")
+                if production_identity_confirmed(run):
+                    if run["ref"] != ref or run["version"] != payload["version"] or run.get("script_version_id") != payload.get("script_version_id"):
+                        raise ValueError("attachment_identity_conflict")
+                    return False
+            else:
+                run = {"id": "production:" + payload["event_id"], "event_id": payload["event_id"],
+                       "account": account, "source": "production", "requested_ref": ref,
+                       "due": None, "submit_begin": None, "submit_ack": None, "accelerator": None,
+                       "push_outcome": None, "state": "external_pending", "active": False,
+                       "registered_at": now, "evidence_provenance": "attachment_metadata"}
+            run.update(ref=ref, version=payload["version"], identity_attached=True,
+                       script_version_id=payload.get("script_version_id"), script_version_mapping_verified=False,
+                       next_poll=now)
+            if row:
+                db.execute("UPDATE production_events SET data=? WHERE event_id=?", (json.dumps(run), payload["event_id"]))
+            else:
+                digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+                db.execute("INSERT INTO production_events VALUES (?,?,NULL,?)", (payload["event_id"], digest, json.dumps(run)))
+            db.execute("INSERT OR REPLACE INTO production_poll_queue VALUES (?,?,?,0)", (payload["event_id"], account, now))
+        self.bump()
+        return True
+
+    def next_production_poll(self, now):
+        with self.connect() as db:
+            # Least recently served eligible account, then earliest due version.
+            row = db.execute('''SELECT e.data FROM production_poll_queue q JOIN production_events e USING(event_id)
+                WHERE q.next_poll<=? ORDER BY
+                COALESCE((SELECT p.last_attempt FROM production_poll_accounts p WHERE p.account=q.account),0),
+                q.next_poll,q.last_attempt,q.event_id LIMIT 1''', (now,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_production_poll(self, event_id, data, error, auth_error, now):
+        source = "production_api:" + event_id
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            run = json.loads(db.execute("SELECT data FROM production_events WHERE event_id=?", (event_id,)).fetchone()[0])
+            if run.get("evidence_provenance") == "provider_artifact":
+                return
+            row = db.execute("SELECT data FROM activity_evidence WHERE account=? AND source=?", (run["account"], source)).fetchone()
+            previous = json.loads(row[0]) if row else {}
+            failed = bool(error or auth_error)
+            if failed:
+                run["poll_errors"] = run.get("poll_errors", 0) + 1
+                delay = min(900, 60 * 2 ** min(run["poll_errors"] - 1, 4))
+                observations = previous.get("observations", [])
+            else:
+                raw, status = data["status"], parse_status(data["status"])
+                state = {"complete": "success", "error": "failed", "cancelled": "cancelled", "queued": "queued", "running": "running"}.get(status, "submitted")
+                if data.get("failure") and status == "complete":
+                    state = "failed"
+                run.update(state=state, provider_status=raw, last_observed=now, poll_errors=0,
+                           execution_provenance="provider_exact_version_status")
+                if status in PROVIDER_TERMINAL:
+                    run["terminal_observed"] = now
+                delay = 60
+                observations = [{"identity": run["id"], "run_type": "production", "ref": run["ref"],
+                                 "version": run["version"], "provider_state": raw, "observed_at": iso(now),
+                                 "state": "terminal" if status in PROVIDER_TERMINAL else "running" if status == "running" else "pending",
+                                 "gpu_requested": run.get("accelerator"), "gpu_verified_devices": run.get("gpu_names")}]
+            run.update(poll_error=error, poll_auth_error=auth_error, poll_attempt_at=now, next_poll=now + delay)
+            db.execute("INSERT OR REPLACE INTO production_poll_accounts VALUES (?,?)", (run["account"], now))
+            snapshot = {"account": run["account"], "source": source, "coverage": "none" if failed else "partial",
+                        "observed_at": previous.get("observed_at") if failed else iso(now),
+                        "last_attempt_at": iso(now), "error": error, "auth_error": auth_error,
+                        "stale_after_seconds": 300, "observations": observations}
+            db.execute("UPDATE production_events SET data=? WHERE event_id=?", (json.dumps(run), event_id))
+            db.execute("INSERT OR REPLACE INTO activity_evidence VALUES (?,?,?)", (run["account"], source, json.dumps(snapshot)))
+            if run["state"] in TERMINAL_STATES:
+                db.execute("DELETE FROM production_poll_queue WHERE event_id=?", (event_id,))
+            else:
+                db.execute("UPDATE production_poll_queue SET next_poll=?,last_attempt=? WHERE event_id=?", (now + delay, now, event_id))
+        self.bump()
 
     def verify_production(self, event_id, evidence, now):
         # Merge evidence without modifying the immutable registration hash or
@@ -800,6 +969,14 @@ class Store:
             run.update(evidence, state="success", active=False, evidence_provenance="provider_artifact",
                        evidence_observed_at=now, provider_status="complete", artifact_filename="queue-monitor-timing.json")
             db.execute("UPDATE production_events SET data=? WHERE event_id=?", (json.dumps(run), event_id))
+            db.execute("DELETE FROM production_poll_queue WHERE event_id=?", (event_id,))
+            source = "production_api:" + event_id
+            snapshot = {"account": run["account"], "source": source, "coverage": "partial",
+                        "observed_at": iso(now), "last_attempt_at": iso(now), "error": None, "auth_error": None,
+                        "stale_after_seconds": 300, "observations": [{"identity": run["id"], "run_type": "production",
+                        "ref": run["ref"], "version": run["version"], "state": "terminal",
+                        "provider_state": "complete", "observed_at": iso(now), "gpu_verified_devices": run.get("gpu_names")}]}
+            db.execute("INSERT OR REPLACE INTO activity_evidence VALUES (?,?,?)", (run["account"], source, json.dumps(snapshot)))
         self.bump()
         return run
 
@@ -927,19 +1104,83 @@ class Store:
                        (run["account"], run["state"], int(active), json.dumps(run), run["id"]))
         self.bump()
 
-    def claim(self, run, now):
+    def admission(self, account, now, required_sources=("browser_discovery",), db=None):
+        if db is None:
+            with self.connect() as connection:
+                return self.admission(account, now, required_sources, connection)
+        account = account.lower()
+        tracked = [json.loads(r[0]) for r in db.execute("SELECT data FROM runs WHERE account=? COLLATE NOCASE", (account,))]
+        tracked += [json.loads(r[0]) for r in db.execute(
+            "SELECT data FROM production_events WHERE lower(json_extract(data,'$.account'))=?", (account,))]
+        snapshots = [json.loads(r[0]) for r in db.execute("SELECT data FROM activity_evidence WHERE account=?", (account,))]
+        activity = account_activity(account, tracked, snapshots, now)
+        reasons = []
+        # Independently retain local unresolved reservations/receipts even if a
+        # collector snapshot reports terminal without resolving its tracked row.
+        for record in tracked:
+            if record["state"] not in TERMINAL_STATES | {"scheduled", "skipped"}:
+                state = ("running" if record["state"] == "running" else "pending"
+                         if record["state"] in {"queued", "submitted"} else "unresolved")
+                reasons.append("activity_" + state)
+        sources = {s["source"]: s for s in activity["sources"]}
+        for name in required_sources:
+            source = sources.get(name)
+            if source is None:
+                reasons.append("required_source_missing:" + name)
+            else:
+                if source["freshness"] != "fresh":
+                    reasons.append("required_source_" + source["freshness"] + ":" + name)
+                if source["coverage"] != "full":
+                    reasons.append("required_coverage_incomplete:" + name)
+        for source in activity["sources"]:
+            if source.get("auth_error"):
+                reasons.append("source_auth_error:" + source["source"])
+            if source.get("error"):
+                reasons.append("source_error:" + source["source"])
+        for observation in activity["observations"]:
+            if observation["state"] != "terminal":
+                reasons.append("activity_" + observation["state"])
+                if observation["freshness"] != "fresh":
+                    reasons.append("nonterminal_" + observation["freshness"])
+        if activity["status"] != "observed_idle":
+            reasons.append("account_" + activity["status"])
+        return {"evaluated_at": iso(now), "would_defer": bool(reasons),
+                "reasons": sorted(set(reasons)), "activity_status": activity["status"],
+                "required_sources": list(required_sources)}
+
+    def claim(self, run, now, policy="observe_only", required_sources=("browser_discovery",)):
+        if policy not in {"observe_only", "enforce"} or not required_sources:
+            raise ValueError("invalid_admission_policy")
         canonical_run(run)
-        run.pop("probe_ref", None)  # This scheduled row has not been pushed yet.
-        run.update(state="pushing", ref=f"{run['account']}/{SLUG}", submit_begin=now,
-                   next_poll=now, errors=0, version=None)
         try:
             with self.connect() as db:
-                claimed = db.execute("UPDATE runs SET account=?,state='pushing',active=1,data=? WHERE id=? AND state='scheduled'",
-                                     (run["account"], json.dumps(run), run["id"])).rowcount == 1
+                # Same write serialization as receipt registration, attachment and
+                # collector snapshots. Persist reservation BEFORE any remote push.
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM runs WHERE id=? AND state='scheduled'", (run["id"],)).fetchone()
+                if not row:
+                    return False
+                run.clear()
+                run.update(json.loads(row[0]))
+                canonical_run(run)
+                decision = self.admission(run["account"], now, required_sources, db)
+                decision["policy"] = policy
+                run["admission"] = decision
+                busy = db.execute("SELECT 1 FROM runs WHERE account=? COLLATE NOCASE AND active=1", (run["account"],)).fetchone()
+                if busy or (policy == "enforce" and decision["would_defer"]):
+                    run.update(state="skipped", skip_reason="account_active" if busy else "activity_deferred",
+                               skip_reasons=decision["reasons"])
+                    db.execute("UPDATE runs SET state='skipped',active=0,data=? WHERE id=?", (json.dumps(run), run["id"]))
+                    claimed = False
+                else:
+                    run.pop("probe_ref", None)
+                    run.update(state="pushing", ref=f"{run['account']}/{SLUG}", submit_begin=now,
+                               next_poll=now, errors=0, version=None)
+                    claimed = db.execute("UPDATE runs SET account=?,state='pushing',active=1,data=? WHERE id=? AND state='scheduled'",
+                                         (run["account"], json.dumps(run), run["id"])).rowcount == 1
         except sqlite3.IntegrityError:
             return False
-        if claimed:
-            self.bump()
+        self.bump()
         return claimed
 
     def call(self, run_id, operation, started, result):
@@ -1061,7 +1302,7 @@ def helper(operation: str):
                                and matching_probe_source(blob.source, payload["id"], payload.get("probe_ref", payload["ref"])))
                     result = {"ok": True, "data": {**diagnostic, "matched": matched}}
                 else:
-                    production = operation == "production_output"
+                    production = operation in {"production_output", "production_status"}
                     if production and (payload.get("source") != "production"
                                        or not isinstance(payload.get("event_id"), str)
                                        or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", payload["event_id"])
@@ -1074,7 +1315,7 @@ def helper(operation: str):
                             or (not production and slug != SLUG)
                             or (production and owner.lower() != os.getenv("KAGGLE_USERNAME", "").lower())):
                         raise ValueError("Invalid identity")
-                    cls = ApiGetKernelSessionStatusRequest if operation == "status" else ApiListKernelSessionOutputRequest
+                    cls = ApiGetKernelSessionStatusRequest if operation in {"status", "production_status"} else ApiListKernelSessionOutputRequest
                     request = cls()
                     request.user_name, request.kernel_slug = owner, slug
                     # Official _kernel_version_label and test_kernel_versions.py
@@ -1084,7 +1325,7 @@ def helper(operation: str):
                     request.version_label = f"v{version}"
                     with api.build_kaggle_client() as client:
                         endpoint = client.kernels.kernels_api_client
-                        if production:
+                        if operation == "production_output":
                             status_request = ApiGetKernelSessionStatusRequest()
                             status_request.user_name, status_request.kernel_slug = owner, slug
                             status_request.version_label = f"v{version}"
@@ -1093,11 +1334,13 @@ def helper(operation: str):
                             if status != "complete" or bool(status_response.failure_message):
                                 result = {"ok": True, "data": {"status": status, "requested_version": version, "timing": None}}
                                 # No artifact fetch, no fabricated terminal failure.
-                        if operation == "status":
+                        if operation in {"status", "production_status"}:
                             response = endpoint.get_kernel_session_status(request)
                             status = getattr(response.status, "name", str(response.status))
                             result = {"ok": True, "data": {"status": status, "failure": bool(response.failure_message),
-                                                            "requested_version": version}}
+                                                             "requested_version": version}}
+                            if production:
+                                result["data"]["requested_ref"] = payload["ref"]
                         elif operation in ("output", "production_output") and (not production or (status == "complete" and not status_response.failure_message)):
                             # Do not use kernels_output: it also retrieves logs. Fetch
                             # ONLY timing.json from the exact version's file listing.
@@ -1196,8 +1439,14 @@ class SummaryCache:
 
 
 class Collector:
-    def __init__(self, store, accounts, auto=False, transport=None):
+    def __init__(self, store, accounts, auto=False, transport=None, admission_policy=None, required_activity_sources=None):
         self.store = store
+        self.admission_policy = admission_policy if admission_policy is not None else os.getenv("PROBE_ADMISSION_POLICY", "observe_only")
+        self.required_activity_sources = tuple(required_activity_sources if required_activity_sources is not None else
+                                              os.getenv("PROBE_REQUIRED_ACTIVITY_SOURCES", "browser_discovery").split(","))
+        if (self.admission_policy not in {"observe_only", "enforce"} or not self.required_activity_sources
+                or any(not s or s.strip() != s for s in self.required_activity_sources)):
+            raise ValueError("invalid_admission_policy")
         self.accounts = {a.username.lower(): Account(a.username.lower(), a.token, a.key) for a in accounts}
         if len(self.accounts) != len(accounts):
             raise ValueError("Duplicate account usernames")
@@ -1226,8 +1475,7 @@ class Collector:
         self.api_last_end = None
         self.api_last_http_status = None
         self.call_timeout = float(getattr(self.transport, "timeout", 0) or DEFAULT_CALL_TIMEOUT)
-        # Bounded shutdown grace: one tick can make at most two bounded remote
-        # calls (one poll + one push).
+        # One poll (probe or production) plus one optional probe push per tick.
         self.shutdown_grace = max(10.0, self.call_timeout * 2 + WATCHDOG_CALL_MARGIN_SECONDS)
         self.summary_cache = SummaryCache(ttl=float(os.getenv("SUMMARY_CACHE_SECONDS", "10") or 10))
         self._exit_hook = None  # Tests may intercept the process-exit watchdog.
@@ -1404,7 +1652,15 @@ class Collector:
                           if r["state"] != "pushing"
                           and r["account"] in self.accounts and r.get("next_poll", 0) <= now),
                          key=lambda r: r.get("next_poll", 0))
-        if polling and not self.stop.is_set():
+        production = self.store.next_production_poll(now)
+        # Alternate lanes under contention; production cannot starve probes or
+        # add a third bounded remote call to the existing shutdown budget.
+        if production and (not polling or self.store.get_meta("last_poll_lane", "probe") == "probe"):
+            if not self.stop.is_set():
+                self.store.set_meta("last_poll_lane", "production")
+                self.poll_production(production)
+        elif polling and not self.stop.is_set():
+            self.store.set_meta("last_poll_lane", "probe")
             self.poll(polling[0], now)
         last_launch = self.store.get_meta("last_launch", 0)
         due = sorted(self.store.runs("state='scheduled' AND due<=?", (now,)),
@@ -1417,6 +1673,8 @@ class Collector:
             # Polling can take up to CALL_TIMEOUT; don't launch an expired slot
             # based on the timestamp taken before that blocking subprocess.
             decision_time = max(now, time.time())
+            run["admission"] = {**self.store.admission(run["account"], decision_time, self.required_activity_sources),
+                                "policy": self.admission_policy}
             reason = None
             if decision_time - run["due"] > 90:
                 reason = "missed_slot"
@@ -1432,11 +1690,36 @@ class Collector:
                 run.update(state="skipped", skip_reason=reason)
                 self.store.save(run)
             elif not launched and decision_time - last_launch >= 15 and not self.stop.is_set():
-                if self.store.claim(run, decision_time):
+                if self.store.claim(run, decision_time, self.admission_policy, self.required_activity_sources):
                     self.store.set_meta("last_launch", decision_time)
                     launched = True
                     busy.add(run["account"])
                     self.push(run, decision_time)
+
+    def poll_production(self, run):
+        error, auth_error, data = None, None, None
+        if not production_identity_confirmed(run):
+            error = "unconfirmed_submission_identity"
+        elif run["account"] not in self.accounts:
+            auth_error = "account_removed"
+        else:
+            result = self.call(run, "production_status")
+            if not result.get("ok"):
+                if result.get("http_status") in {401, 403}:
+                    auth_error = "provider_auth_denied"
+                else:
+                    error = "api_timeout" if result.get("error") == "api_timeout" else "provider_status_unavailable"
+            else:
+                data = result.get("data")
+                try:
+                    if (not isinstance(data, dict) or type(data.get("requested_version")) is not int
+                            or data["requested_version"] != run["version"] or data.get("requested_ref") != run["ref"]
+                            or type(data.get("failure")) is not bool):
+                        raise ValueError()
+                    parse_status(data["status"])
+                except (ValueError, KeyError, TypeError):
+                    error = "status_identity_or_protocol"
+        self.store.record_production_poll(run["event_id"], data, error, auth_error, time.time())
 
     def push(self, run, decision_time):
         try:
@@ -1637,21 +1920,105 @@ def roadmap_snapshot() -> dict:
             "snapshot": payload}
 
 
+def account_activity(name, tracked, snapshots, now):
+    sources, observations = [], []
+    for snapshot in snapshots:
+        if snapshot["account"] != name:
+            continue
+        source = {k: v for k, v in snapshot.items() if k != "observations"}
+        at = timestamp(source["observed_at"]) if source.get("observed_at") else None
+        source["freshness"] = ("unknown" if at is None else "fresh"
+                               if 0 <= now - at <= source["stale_after_seconds"] else "stale")
+        sources.append(source)
+        for observation in snapshot["observations"]:
+            age = now - timestamp(observation["observed_at"])
+            observations.append({**observation, "account": name, "source": source["source"],
+                                 "coverage": source["coverage"],
+                                 "stale_after_seconds": source["stale_after_seconds"],
+                                 "freshness": "fresh" if 0 <= age <= source["stale_after_seconds"] else "stale"})
+    for run in tracked:
+        if run["account"] != name:
+            continue
+        state = run["state"]
+        if state in {"scheduled", "skipped"}:
+            continue
+        normalized = ("terminal" if state in TERMINAL_STATES else "running" if state == "running"
+                      else "pending" if state in {"queued", "submitted"} else "unresolved")
+        if run.get("source") == "production":
+            source = "production_api:" + run["event_id"]
+            matching = [o for o in observations if o["source"] == source and o["identity"] == run["id"]]
+            if normalized == "unresolved":
+                # A snapshot cannot resolve the underlying registration. Keep
+                # its source/error metadata, but expose one unresolved identity
+                # until the adapter actually updates the tracked record.
+                observations = [o for o in observations if not (o["source"] == source and o["identity"] == run["id"])]
+            elif matching:
+                # Resolved records use the adapter's authoritative snapshot,
+                # including failure retention, without duplicate positives.
+                continue
+        at = run.get("last_observed", run.get("evidence_observed_at", run.get("registered_at", run.get("submit_ack"))))
+        if run.get("source") == "production":
+            at = run.get("last_observed", run.get("evidence_observed_at"))
+        observations.append({"account": name, "identity": run["id"], "source": "tracked_" + run.get("source", "probe"),
+                             "run_type": run.get("source", "probe"), "ref": run.get("ref"), "version": run.get("version"),
+                             "state": normalized, "provider_state": run.get("last_status", run.get("provider_status")),
+                             "observed_at": iso(at) if at is not None else None, "coverage": "partial",
+                             "stale_after_seconds": 300,
+                             "freshness": "fresh" if at is not None and 0 <= now - at <= 300 else "stale" if at is not None else "unknown",
+                             "gpu_requested": run.get("accelerator"), "gpu_verified_devices": run.get("gpu_names")})
+    # A failed collector invalidates its retained positive evidence for current status.
+    failed_sources = {s["source"] for s in sources if s.get("error") or s.get("auth_error")}
+    current = [o for o in observations if o["freshness"] == "fresh" and o["source"] not in failed_sources]
+    nonterminal = [o for o in observations if o["state"] != "terminal"]
+    full = any(s["coverage"] == "full" and s["freshness"] == "fresh" for s in sources)
+    coverage = "full" if full else "partial" if observations or any(s["coverage"] == "partial" for s in sources) else "none"
+    if any(o["state"] == "running" for o in current):
+        status = "running"
+    elif any(o["state"] == "pending" for o in current):
+        status = "pending"
+    elif any(o["state"] == "unresolved" for o in nonterminal):
+        status = "unresolved"
+    elif failed_sources:
+        status = "unknown"
+    elif nonterminal or (sources and all(s["freshness"] == "stale" for s in sources)):
+        status = "stale"
+    elif full:
+        status = "observed_idle"
+    else:
+        status = "partial" if coverage == "partial" else "unknown"
+    times = [s["observed_at"] for s in sources if s.get("observed_at")]
+    times += [o["observed_at"] for o in observations if o.get("observed_at")]
+    return {"status": status, "coverage": coverage, "observed_at": max(times, key=timestamp) if times else None,
+            "sources": sources, "observations": observations}
+
+
 def build_summary(collector: Collector, config_error, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     store = collector.store
     runs = store.runs("state!='scheduled'", limit=SUMMARY_RUN_LIMIT)
     pending = store.next_probes(now)
     active = {r["account"]: r for r in store.runs("active=1")}
+    snapshots = store.activity_evidence()
+    with store.connect() as db:
+        # Bound terminal history, but never hide older unresolved production registrations.
+        production = [json.loads(r[0]) for r in db.execute('''SELECT data FROM production_events
+            WHERE json_extract(data,'$.state') NOT IN ('success','failed','wrong_gpu','invalid_output','cancelled')
+            OR event_id IN (SELECT event_id FROM production_events ORDER BY submit_begin DESC,event_id LIMIT ?)
+            ORDER BY submit_begin DESC,event_id''', (SUMMARY_RUN_LIMIT,))]
+    tracked = list({r["id"]: r for r in runs + list(active.values()) + production}.values())
     accounts = []
-    for name in sorted(set(collector.accounts) | set(active)):
+    for name in sorted(set(collector.accounts) | set(active) | {r["account"] for r in production} | {s["account"] for s in snapshots}):
         account_runs = [r for r in runs if r["account"] == name]
         latest = active.get(name) or (account_runs[0] if account_runs else None)
         sampled = [r for r in account_runs if r.get("submit_begin") is not None]
         latest_sample = sampled[0] if sampled else None
         state = active[name]["state"] if name in active else "idle"
+        activity = account_activity(name, tracked, snapshots, now)
         accounts.append({"id": name, "name": name, "username": name,
-                         "status": frontend_status(state), "state": state,
+                          "admission": {**store.admission(name, now, collector.required_activity_sources),
+                                        "policy": collector.admission_policy},
+                         "status": activity["status"], "state": activity["status"], "activity": activity,
+                         "probe_status": frontend_status(state), "probe_active_runs": int(name in active),
                          "sample_count": len(sampled),
                          "day_count": len({datetime.fromtimestamp(r["due"], LOCAL).date() for r in sampled}),
                          "active_runs": int(name in active),
@@ -1694,10 +2061,12 @@ def build_summary(collector: Collector, config_error, now: float | None = None) 
                                   "newest_due_utc": iso(runs[0]["due"]) if runs else None,
                                   "all_history_retained": True,
                                   "cache_ttl_seconds": collector.summary_cache.ttl},
-            "auto_probes": collector.auto, "ready": collector.ready,
+             "auto_probes": collector.auto, "ready": collector.ready,
+             "probe_admission_policy": collector.admission_policy,
+             "required_activity_sources": list(collector.required_activity_sources),
             "cancellation_supported": False,
             "success_5m_metric": "confirmed T4x2 submit-to-start upper bound <=300 seconds / all attempted submissions"}
-    return {"schema_version": SCHEMA_VERSION,
+    return {"schema_version": SCHEMA_VERSION, "activity_contract_version": 1,
             "meta": meta, "hours": hours, "timezone": "Asia/Ho_Chi_Minh", "generated_at": generated_at,
             "auto_probes": collector.auto, "ready": collector.ready,
             "accounts": accounts, "runs": [frontend_run(r) for r in runs[:200]], "hourly": hours,
@@ -1848,6 +2217,39 @@ def create_app():
         if not hmac.compare_digest(x_monitor_token.encode(), token.encode()):
             raise HTTPException(401, "invalid_monitor_token")
 
+    @app.post("/api/activity/browser-discovery")
+    async def browser_discovery(request: Request, x_discovery_token: str = Header("")):
+        # Separate least-privilege credential: production ingest tokens do not
+        # authorize browser evidence, and browser tokens cannot register work.
+        from discovery_contract import validate
+        try:
+            token_path = Path(os.environ["DISCOVERY_INGEST_TOKEN_FILE"])
+            if token_path.stat().st_size > 512:
+                raise ValueError("invalid_token")
+            token = token_path.read_text().strip()
+            if not token:
+                raise ValueError("invalid_token")
+        except (KeyError, OSError, ValueError):
+            raise HTTPException(503, "discovery_ingest_disabled") from None
+        if not hmac.compare_digest(x_discovery_token.encode(), token.encode()):
+            raise HTTPException(401, "invalid_discovery_token")
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 65536:
+                raise HTTPException(413, "discovery_payload_too_large")
+            data.extend(chunk)
+        collector = app.state.collector
+        try:
+            payload = validate(json.loads(data), collector.accounts, time.time())
+        except (ValueError, TypeError, KeyError, OverflowError):
+            raise HTTPException(422, "invalid_discovery_snapshot") from None
+        import asyncio
+        accepted = await asyncio.to_thread(
+            collector.store.record_activity, payload["account"], "browser_discovery",
+            payload["observations"], payload["coverage"], payload["observed_at"],
+            error=payload["error"], auth_error=payload["auth_error"], stale_after_seconds=300)
+        return {"accepted": accepted, "source": "browser_discovery", "coverage": payload["coverage"]}
+
     @app.post("/api/production/register")
     def production_register(payload: dict = Body(...), x_monitor_token: str = Header("")):
         authenticate_ingest(x_monitor_token)
@@ -1860,6 +2262,20 @@ def create_app():
         return {"schema_version": 2, "event_id": payload["event_id"], "created": created,
                 "source": "production", "evidence_provenance": "registration_metadata",
                 "primary_timing_accepted": False, "polled": False, "blocks_probe": False}
+
+    @app.post("/api/production/attach")
+    def production_attach(payload: dict = Body(...), x_monitor_token: str = Header("")):
+        authenticate_ingest(x_monitor_token)
+        try:
+            validate_production_attachment(payload, app.state.collector.accounts)
+            created = app.state.collector.store.attach_production(payload, time.time())
+        except ValueError as exc:
+            reason = str(exc)
+            raise HTTPException(409 if reason == "attachment_identity_conflict" else 422, reason) from None
+        return {"schema_version": 2, "event_id": payload["event_id"], "created": created,
+                "source": "production", "primary_timing_accepted": False,
+                "identity_provenance": "caller_attachment", "script_version_mapping_verified": False,
+                "blocks_probe": False}
 
     @app.post("/api/production/verify")
     def production_verify(payload: dict = Body(...), x_monitor_token: str = Header("")):
@@ -1882,9 +2298,10 @@ def create_app():
             return {**response, "reason": "unregistered_account"}
         # Never promote requested identity, a timeout, or an uncertain version
         # into a confirmed provider identity. Legacy registrations may lack it.
-        if (run["push_outcome"] != "accepted" or run.get("ref") != run.get("requested_ref")
-                or not isinstance(run.get("version"), int) or isinstance(run["version"], bool) or run["version"] < 1):
+        if not production_identity_confirmed(run):
             return {**response, "reason": "unconfirmed_submission_identity"}
+        if run.get("submit_begin") is None:
+            return {**response, "reason": "submission_time_unavailable"}
         try:
             fetched = collector.transport.invoke("production_output", {
                 "source": "production", "ref": run["ref"], "version": run["version"], "event_id": event_id}, account)

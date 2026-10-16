@@ -9,7 +9,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py discovery_contract.py ./
 COPY --from=frontend /frontend/dist ./static
 COPY roadmap.json ./roadmap.json
 ENV MONITOR_DB=/data/monitor.sqlite3 ACCOUNTS_ENV=/run/secrets/accounts.env PYTHONUNBUFFERED=1

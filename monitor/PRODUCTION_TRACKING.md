@@ -141,6 +141,10 @@ submission status.
 
 ## Integration gap and verification
 
+The backend now provides independent bounded exact-version execution polling and
+an authenticated existing-run attachment endpoint; see `PRODUCTION-POLLING.md`.
+Polling does not automatically verify timing artifacts or establish account idle.
+
 After provider execution, explicitly request backend verification:
 
 ```powershell

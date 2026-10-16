@@ -114,6 +114,17 @@ it("labels Overview sample_count as submission attempts rather than evidence", (
   expect(screen.queryByText(/mẫu có bằng chứng/)).toBeNull();
 });
 
+it("does not display legacy probe-only idle as account idle", () => {
+  (monitor.summary as { data: { accounts: unknown[] } }).data.accounts = [
+    { id: "a", name: "a", status: "idle", active_runs: 0, latest_run: { status: "completed" } },
+  ];
+  render(<MemoryRouter><OverviewPage /></MemoryRouter>);
+  expect(screen.getByText("Probe đang hoạt động")).toBeTruthy();
+  expect(screen.getByText(/không suy ra rảnh từ probe hoàn tất/)).toBeTruthy();
+  expect(screen.queryByText("Rảnh")).toBeNull();
+  expect(screen.queryByText("Quan sát không có hoạt động")).toBeNull();
+});
+
 it("keeps a ten-minute-old deployment snapshot fresh under the 24-hour roadmap policy", () => {
   roadmap(new Date(now.getTime() - 10 * 60 * 1000).toISOString());
   expect(screen.getByText("Ảnh chụp lộ trình · đồng bộ trong 24 giờ")).toBeTruthy();

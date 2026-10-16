@@ -24,6 +24,7 @@ import {
 import type { Run } from "@/types";
 import { cn } from "@/lib/utils";
 import { DataFreshness } from "@/components/shared/data-freshness";
+import { AccountActivityEvidence, activityStatus } from "@/components/shared/account-activity";
 
 const TONE_TEXT: Record<Tone, string> = {
   neutral: "text-foreground",
@@ -56,8 +57,8 @@ export default function OverviewPage() {
     hours.length > 0 && hours.every((hour) => typeof hour[key] === "number")
       ? hours.reduce((total, hour) => total + hour[key], 0) : null;
   const successful = sum("successful_t4x2");
-  const activeAccounts = accounts.length > 0 && accounts.every((account) => account.active_runs != null)
-    ? accounts.filter((account) => account.active_runs).length : null;
+  const activeAccounts = !summary.error && accounts.length > 0 && accounts.every((account) => account.activity != null)
+    ? accounts.filter((account) => ["running", "pending"].includes(activityStatus(account.activity, summary.error))).length : null;
   const recent = sortRuns(runs).slice(0, 6);
 
   return (
@@ -117,9 +118,9 @@ export default function OverviewPage() {
               icon={<TimerReset className="size-4" />}
             />
             <StatCard
-              label="Tài khoản đang hoạt động"
+              label="Tài khoản có bằng chứng đang chạy/chờ"
               value={`${formatCount(activeAccounts)} / ${formatCount(accounts.length)}`}
-              hint={meta?.api_in_flight === true ? "Có lệnh gọi API đang chạy" : meta?.api_in_flight === false ? "Không có lệnh gọi API đang chạy" : "Chưa rõ hoạt động API"}
+              hint="Số còn lại có thể chưa rõ hoặc thiếu độ phủ; không chứng minh rảnh"
               tone={activeAccounts !== null && activeAccounts > 0 ? "warning" : "neutral"}
               icon={<Activity className="size-4" />}
             />
@@ -145,7 +146,7 @@ export default function OverviewPage() {
                       <CardTitle className="truncate text-base" title={account.name}>
                         {account.name}
                       </CardTitle>
-                      <StatusBadge status={account.status ?? account.state} />
+                      <StatusBadge status={activityStatus(account.activity, summary.error)} />
                     </CardHeader>
                     <CardContent className="space-y-3">
                       <div>
@@ -164,8 +165,8 @@ export default function OverviewPage() {
                         <KeyValue term="Số mẫu" value={formatCount(account.sample_count)} />
                         <KeyValue term="Ngày phủ" value={formatCount(account.day_count)} />
                         <KeyValue
-                          term="Đang hoạt động"
-                           value={account.active_runs == null ? "Chưa rõ" : account.active_runs > 0 ? "Có" : "Không"}
+                          term="Probe đang hoạt động"
+                          value={formatCount(account.probe_active_runs ?? account.active_runs)}
                         />
                         <KeyValue
                           term="Lượt kế tiếp"
@@ -176,6 +177,7 @@ export default function OverviewPage() {
                           value={formatDateTime(account.updated_at, mode)}
                         />
                       </dl>
+                      <AccountActivityEvidence activity={account.activity} collectionError={summary.error} />
                     </CardContent>
                   </Card>
                 ))}

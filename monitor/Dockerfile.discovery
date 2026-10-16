@@ -1,0 +1,8 @@
+FROM mcr.microsoft.com/playwright/python@sha256:640d578aae63cfb632461d1b0aecb01414e4e020864ac3dd45a868dc0eff3078
+RUN timeout 60s python -m pip install --no-cache-dir --only-binary=:all: --retries 0 --timeout 15 playwright==1.55.0 pyee==13.0.0 greenlet==3.2.4
+WORKDIR /worker
+COPY discovery_contract.py discovery_visit.py discovery_worker.py ./
+RUN mkdir -p /var/lib/discovery && chown 1000:1000 /var/lib/discovery && chmod 700 /var/lib/discovery
+USER 1000:1000
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+CMD ["python", "discovery_worker.py"]

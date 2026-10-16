@@ -57,6 +57,31 @@ export interface Run {
   [key: string]: unknown;
 }
 
+export interface ActivityObservation {
+  identity: string;
+  account: string;
+  source: string;
+  run_type: "probe" | "production" | "interactive" | "unknown";
+  provider_state: string | null;
+  state: "running" | "pending" | "unresolved" | "terminal";
+  observed_at: string | null;
+  coverage: "full" | "partial" | "none";
+  freshness: "fresh" | "stale" | "unknown";
+  stale_after_seconds?: number;
+  gpu_requested?: string | null;
+  gpu_verified_devices?: string[] | null;
+}
+
+export interface AccountActivity {
+  status: string;
+  coverage: "full" | "partial" | "none";
+  observed_at: string | null;
+  sources: { source: string; observed_at: string | null; last_attempt_at: string;
+    coverage: string; freshness: string; stale_after_seconds: number;
+    error: string | null; auth_error: string | null }[];
+  observations: ActivityObservation[];
+}
+
 export interface Account {
   id: string;
   name: string;
@@ -66,6 +91,9 @@ export interface Account {
   sample_count?: number;
   day_count?: number;
   active_runs?: number;
+  probe_active_runs?: number;
+  probe_status?: string;
+  activity?: AccountActivity;
   blocked?: number;
   queue_estimate_seconds?: number | null;
   queue_lower_seconds?: number | null;
@@ -114,6 +142,7 @@ export interface ApiCall {
 }
 
 export interface Summary {
+  activity_contract_version?: number;
   schema_version?: number;
   meta: Meta;
   hours: HourStat[];

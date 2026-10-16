@@ -1,0 +1,26 @@
+# Isolated Phase 7 base; never merge with production compose.yaml.
+services:
+  monitor:
+    image: kaggle-phase7-monitor:local
+    build:
+      context: .
+      dockerfile: Dockerfile.pilot
+    restart: "no"
+    init: true
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 0.75
+    pids_limit: 128
+    stop_grace_period: 220s
+    environment:
+      AUTO_PROBES: "false"
+      PROBE_ADMISSION_POLICY: observe_only
+      MONITOR_DB: /data/monitor.sqlite3
+      ACCOUNTS_ENV: /run/secrets/accounts.env
+      MONITOR_INGEST_TOKEN: ""
+    ports: ["127.0.0.1:3001:3000"]
+    volumes:
+      - pilot-monitor-data:/data
+      - ${PILOT_ACCOUNTS_ENV:?private thangma-only account file required}:/run/secrets/accounts.env:ro
+volumes:
+  pilot-monitor-data:

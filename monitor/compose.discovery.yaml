@@ -1,0 +1,42 @@
+# Explicit opt-in overlay; master authorizes application of this in Phase 7.
+# docker compose -f compose.yaml -f compose.discovery.yaml --profile discovery ...
+services:
+  monitor:
+    environment:
+      DISCOVERY_INGEST_TOKEN_FILE: /run/discovery-token/token
+      PROBE_ADMISSION_POLICY: observe_only
+    volumes:
+      - ${DISCOVERY_TOKEN_DIR:-/home/thangma/.local/share/kaggle-monitor-discovery-token}:/run/discovery-token:ro
+  discovery:
+    profiles: [discovery]
+    build:
+      context: .
+      dockerfile: Dockerfile.discovery
+    restart: "no"
+    init: true
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 0.75
+    pids_limit: 128
+    shm_size: 128m
+    stop_grace_period: 65s
+    environment:
+      DISCOVERY_ENABLED: "${DISCOVERY_ENABLED:-false}"
+    volumes:
+      - /home/thangma/.local/share/kaggle-monitor-auth/thangma:/private/thangma
+      - ${DISCOVERY_TOKEN_DIR:-/home/thangma/.local/share/kaggle-monitor-discovery-token}:/run/discovery-token:ro
+      - discovery-data:/var/lib/discovery
+    tmpfs:
+      - /tmp:size=192m,mode=1777
+    healthcheck:
+      test: [CMD, python, -c, "import json,time; from pathlib import Path; s=json.loads(Path('/var/lib/discovery/state.json').read_text()); assert not s.get('suspended') and s.get('ingestion')=='ok' and time.time()-s.get('last_success',0)<600"]
+      interval: 60s
+      timeout: 5s
+      start_period: 90s
+      retries: 2
+volumes:
+  discovery-data:

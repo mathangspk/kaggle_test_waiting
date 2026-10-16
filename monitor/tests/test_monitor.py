@@ -1069,7 +1069,8 @@ def test_summary_frontend_contract_with_known_and_unknown_queue(tmp_path):
                 assert hour["rank_eligible"] is False and hour["rank"] is None
                 assert hour["failures"] == 1 and hour["incomplete"] == 1 and hour["skipped"] == 1
                 accounts = {a["id"]: a for a in body["accounts"]}
-                assert accounts["b"]["name"] == "b" and accounts["b"]["status"] == "queued"
+                assert accounts["b"]["name"] == "b" and accounts["b"]["probe_status"] == "queued"
+                assert accounts["b"]["status"] == "stale"
                 assert accounts["b"]["next_probe_utc"] == m.iso(future_due)
             finally:
                 release.set()
